@@ -12,11 +12,15 @@ Supports:
 Every message still gets a fresh CEK, fresh nonces, and a fresh AEAD pass, so
 wire messages remain protocol-valid DIDComm v1 envelopes.
 
-Cache invalidation: any ConnRecord event (update, DID rotation, deletion)
-evicts that connection's cache entry via an event-bus subscription (see
-v1_0.__init__.setup). FASTPATH_CACHE_TTL (default 300, 0 disables) is
-checked lazily on access; it refreshes active entries but does not sweep idle
-ones. DELETE /didcomm-fastpath/cache still clears everything manually.
+Cache hardening:
+- Keys are ``(local_tenant_wallet_id, connection_id)``. ``wallet_id`` is *our*
+  ACA-Py tenant subwallet (``profile.settings["wallet.id"]``), not the remote
+  peer. Isolation prevents one tenant from reusing another's cached sender_xk.
+- FASTPATH_CACHE_TTL (default 30; 0 disables): lazy on access + ~1s active sweep.
+- FASTPATH_CACHE_MAX (default 8192): LRU eviction. Size by peak *concurrent*
+  active (tenant, connection) pairs on this process, not total connections.
+- ConnRecord events, DELETE /cache, and tenant removal (invalidate_wallet /
+  EventBus) dispose Askar Key handles by dropping refs.
 """
 
 from __future__ import annotations
@@ -48,6 +52,10 @@ BASICMESSAGE_TYPE_OLD = "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/basicmessage/1.0/me
 DIDCOMM_V0_MIME = "application/ssi-agent-wire"
 DIDCOMM_V1_MIME = "application/didcomm-envelope-enc"
 
+# Custom EventBus topic (optional emitters e.g. Kanon multitenant manager).
+WALLET_REMOVED_TOPIC = "acapy::didcomm_fastpath::wallet_removed"
+SWEEP_INTERVAL_SECONDS = 1.0
+
 
 @dataclass
 class RecipientCrypto:
@@ -68,6 +76,8 @@ class CachedTarget:
     routing_verkeys: List[str]
     sender_vk_b: bytes  # base58 sender verkey, utf-8 encoded
     sender_xk: Key  # sender X25519 keypair (independent handle)
+    wallet_id: str = "base"
+    connection_id: str = ""
     cached_at: float = 0.0  # time.monotonic() at cache insert, for TTL expiry
 
 
@@ -99,19 +109,80 @@ class StageStats:
         }
 
 
+@dataclass
+class CacheMetrics:
+    """Counters for cache lifecycle events."""
+
+    evictions_lru: int = 0
+    expirations_ttl: int = 0
+    invalidations_connection: int = 0
+    invalidations_wallet: int = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "evictions_lru": self.evictions_lru,
+            "expirations_ttl": self.expirations_ttl,
+            "invalidations_connection": self.invalidations_connection,
+            "invalidations_wallet": self.invalidations_wallet,
+        }
+
+
+def wallet_id_for_profile(profile: Profile) -> str:
+    """Local ACA-Py tenant subwallet id for cache scoping.
+
+    This is *our* tenant (``wallet.id`` on the sending profile), not the remote
+    peer's wallet. Single-tenant / base agents fall back to ``\"base\"``.
+    """
+    settings = getattr(profile, "settings", None)
+    if settings is not None:
+        wid = settings.get("wallet.id")
+        if wid:
+            return str(wid)
+    name = getattr(profile, "name", None) or getattr(profile, "profile_id", None)
+    return str(name) if name else "base"
+
+
+def cache_key(wallet_id: str, connection_id: str) -> str:
+    """``{local_tenant_wallet_id}:{connection_id}`` — never connection_id alone."""
+    return f"{wallet_id}:{connection_id}"
+
+
+def dispose_target(target: Optional[CachedTarget]) -> None:
+    """Drop Askar Key refs so CPython can free/zeroize native handles.
+
+    Aries Askar frees key material when the last Python Key reference is
+    dropped (``askar_key_free``); Rust zeroizes on drop (best-effort).
+    """
+    if target is None:
+        return
+    try:
+        for rec in list(target.recipients or []):
+            rec.xk = None  # type: ignore[assignment]
+        target.recipients.clear()
+        for rec in list(target.routing_recipients or []):
+            rec.xk = None  # type: ignore[assignment]
+        target.routing_recipients.clear()
+        target.sender_xk = None  # type: ignore[assignment]
+        target.sender_vk_b = b""
+    except Exception:  # pragma: no cover - defensive
+        LOGGER.debug("dispose_target failed", exc_info=True)
+
+
 class FastpathState:
-    """Singleton plugin state: target cache, HTTP session, stage stats."""
+    """Singleton plugin state: wallet-scoped LRU target cache, HTTP, stats."""
 
     STAGES = ("resolve_cold", "build", "pack", "deliver", "total")
 
     def __init__(self):
-        self.targets: Dict[str, CachedTarget] = {}
+        self.targets: "OrderedDict[str, CachedTarget]" = OrderedDict()
         self._http: Optional[ClientSession] = None
         self.stats: Dict[str, StageStats] = {s: StageStats() for s in self.STAGES}
+        self.cache_metrics = CacheMetrics()
         self.first_send_ts: Optional[float] = None
         self.last_send_ts: Optional[float] = None
         # Optional external timing dict (e.g. workflow_protocol stages)
         self.external_stats: Dict[str, Any] = {}
+        self._sweep_task: Optional[asyncio.Task] = None
 
     def record(self, stage: str, ns: int):
         if stage not in self.stats:
@@ -125,20 +196,150 @@ class FastpathState:
             window = self.last_send_ts - self.first_send_ts
             out["observed_rps"] = round(sends / window, 2)
             out["window_seconds"] = round(window, 3)
-        out["cached_connections"] = len(self.targets)
+        n = len(self.targets)
+        out["cache_entries"] = n
+        out["cached_connections"] = n  # alias kept for older dashboards
+        out["cache_max"] = cache_max_entries()
+        out["ttl_seconds"] = cache_ttl_seconds()
         out["pack_workers"] = _PACK_POOL._max_workers  # type: ignore[attr-defined]
+        out.update(self.cache_metrics.as_dict())
         if self.external_stats:
             out["workflow"] = self.external_stats
         return out
 
     def reset_stats(self):
+        """Reset timing counters only (keeps cache + eviction metrics)."""
         self.stats = {s: StageStats() for s in self.STAGES}
         self.first_send_ts = None
         self.last_send_ts = None
 
-    def invalidate(self, connection_id: str) -> bool:
-        """Drop one connection's cached target (DID rotation, deletion, etc.)."""
-        return self.targets.pop(connection_id, None) is not None
+    def get(self, wallet_id: str, connection_id: str) -> Optional[CachedTarget]:
+        """Return a fresh cached target, touching LRU order on hit."""
+        key = cache_key(wallet_id, connection_id)
+        cached = self.targets.get(key)
+        if not cached:
+            return None
+        ttl = cache_ttl_seconds()
+        if ttl > 0 and (time.monotonic() - cached.cached_at) >= ttl:
+            self._pop_and_dispose(key, reason="ttl")
+            return None
+        self.targets.move_to_end(key)
+        return cached
+
+    def put(self, wallet_id: str, connection_id: str, target: CachedTarget) -> None:
+        """Insert/replace a target; evict LRU entries if over max size."""
+        key = cache_key(wallet_id, connection_id)
+        target.wallet_id = wallet_id
+        target.connection_id = connection_id
+        if key in self.targets:
+            old = self.targets.pop(key)
+            dispose_target(old)
+        self.targets[key] = target
+        self.targets.move_to_end(key)
+        max_entries = cache_max_entries()
+        while max_entries > 0 and len(self.targets) > max_entries:
+            old_key, old = self.targets.popitem(last=False)
+            dispose_target(old)
+            self.cache_metrics.evictions_lru += 1
+            LOGGER.debug("didcomm_fastpath: LRU evicted %s", old_key)
+
+    def invalidate(self, connection_id: str, *, wallet_id: str) -> bool:
+        """Drop one connection's cached target for a specific local tenant."""
+        if not wallet_id:
+            raise ValueError("wallet_id is required (local tenant subwallet id)")
+        removed = self._pop_and_dispose(
+            cache_key(wallet_id, connection_id), reason="connection"
+        )
+        return removed is not None
+
+    def invalidate_wallet(self, wallet_id: str) -> int:
+        """Drop all cached targets for one local tenant subwallet."""
+        if not wallet_id:
+            return 0
+        prefix = f"{wallet_id}:"
+        keys = [k for k in self.targets if k.startswith(prefix)]
+        for key in keys:
+            self._pop_and_dispose(key, reason="wallet")
+        if keys:
+            LOGGER.info(
+                "didcomm_fastpath: cleared %d cache entries for tenant wallet %s",
+                len(keys),
+                wallet_id,
+            )
+        return len(keys)
+
+    def clear(self, wallet_id: Optional[str] = None) -> int:
+        """Clear all entries, or only those for one wallet."""
+        if wallet_id is not None:
+            return self.invalidate_wallet(wallet_id)
+        n = len(self.targets)
+        while self.targets:
+            _, old = self.targets.popitem(last=True)
+            dispose_target(old)
+        return n
+
+    def expire_stale(self) -> int:
+        """Actively drop TTL-expired entries; return count removed."""
+        ttl = cache_ttl_seconds()
+        if ttl <= 0:
+            return 0
+        now = time.monotonic()
+        stale = [
+            key
+            for key, target in self.targets.items()
+            if (now - target.cached_at) >= ttl
+        ]
+        for key in stale:
+            self._pop_and_dispose(key, reason="ttl")
+        return len(stale)
+
+    def _pop_and_dispose(
+        self, key: str, reason: str
+    ) -> Optional[CachedTarget]:
+        target = self.targets.pop(key, None)
+        if target is None:
+            return None
+        dispose_target(target)
+        if reason == "ttl":
+            self.cache_metrics.expirations_ttl += 1
+        elif reason == "connection":
+            self.cache_metrics.invalidations_connection += 1
+        elif reason == "wallet":
+            self.cache_metrics.invalidations_wallet += 1
+        return target
+
+    def start_sweeper(self) -> None:
+        """Start background TTL sweep if not already running."""
+        if self._sweep_task and not self._sweep_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            LOGGER.debug("didcomm_fastpath: no running loop; sweeper not started")
+            return
+
+        async def _sweep_loop():
+            while True:
+                try:
+                    await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+                    n = self.expire_stale()
+                    if n:
+                        LOGGER.debug(
+                            "didcomm_fastpath: active TTL expired %d entries", n
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pragma: no cover
+                    LOGGER.exception("didcomm_fastpath: cache sweeper error")
+
+        self._sweep_task = loop.create_task(
+            _sweep_loop(), name="didcomm-fastpath-cache-sweep"
+        )
+
+    def stop_sweeper(self) -> None:
+        if self._sweep_task and not self._sweep_task.done():
+            self._sweep_task.cancel()
+        self._sweep_task = None
 
     def http(self) -> ClientSession:
         if self._http is None or self._http.closed:
@@ -158,14 +359,23 @@ _PACK_POOL = ThreadPoolExecutor(
 
 
 def cache_ttl_seconds() -> float:
-    """TTL for cached targets; fallback safety net behind event-bus eviction.
+    """TTL for cached targets (seconds). Default 30; 0 disables expiry."""
+    try:
+        return float(os.environ.get("FASTPATH_CACHE_TTL", "30"))
+    except ValueError:
+        return 30.0
 
-    0 (or negative) disables expiry.
+
+def cache_max_entries() -> int:
+    """Maximum cached targets (LRU). Default 8192; 0 disables the bound.
+
+    Size by peak concurrently-active (tenant, connection) pairs on this
+    process (idle entries fall out via TTL), not by total connections.
     """
     try:
-        return float(os.environ.get("FASTPATH_CACHE_TTL", "300"))
+        return int(os.environ.get("FASTPATH_CACHE_MAX", "8192"))
     except ValueError:
-        return 300.0
+        return 8192
 
 
 def deliver_override_endpoint() -> Optional[str]:
@@ -191,12 +401,10 @@ def _recipient_crypto(verkey: str, sender_vk_b: bytes) -> RecipientCrypto:
 
 async def resolve_target(profile: Profile, connection_id: str) -> CachedTarget:
     """Resolve and cache all send material for a connection (cold path)."""
-    cached = STATE.targets.get(connection_id)
+    wallet_id = wallet_id_for_profile(profile)
+    cached = STATE.get(wallet_id, connection_id)
     if cached:
-        ttl = cache_ttl_seconds()
-        if ttl <= 0 or (time.monotonic() - cached.cached_at) < ttl:
-            return cached
-        STATE.invalidate(connection_id)
+        return cached
 
     start = time.perf_counter_ns()
     conn_mgr = profile.inject(BaseConnectionManager)
@@ -227,9 +435,11 @@ async def resolve_target(profile: Profile, connection_id: str) -> CachedTarget:
         routing_verkeys=list(target.routing_keys or []),
         sender_vk_b=sender_vk_b,
         sender_xk=sender_xk,
+        wallet_id=wallet_id,
+        connection_id=connection_id,
         cached_at=time.monotonic(),
     )
-    STATE.targets[connection_id] = cached
+    STATE.put(wallet_id, connection_id, cached)
     STATE.record("resolve_cold", time.perf_counter_ns() - start)
     return cached
 
@@ -350,22 +560,18 @@ def pack_for_target(message: bytes, target: CachedTarget) -> bytes:
     return packed
 
 
-async def send_packed(
-    profile: Profile, connection_id: str, message: Union[bytes, Any]
+async def _pack_and_deliver(
+    profile: Profile,
+    connection_id: str,
+    body: bytes,
+    *,
+    t_total: int,
 ) -> dict:
-    """Fast-path pack+deliver for arbitrary DIDComm plaintext (or AgentMessage)."""
-    t_total = time.perf_counter_ns()
-    if STATE.first_send_ts is None:
-        STATE.first_send_ts = time.monotonic()
-
+    """Shared hot path: resolve → pack (thread pool) → HTTP deliver."""
     target = await resolve_target(profile, connection_id)
 
     t = time.perf_counter_ns()
-    body = serialize_agent_message(message)
-    STATE.record("build", time.perf_counter_ns() - t)
-
-    t = time.perf_counter_ns()
-    packed = await asyncio.get_event_loop().run_in_executor(
+    packed = await asyncio.get_running_loop().run_in_executor(
         _PACK_POOL, pack_for_target, body, target
     )
     STATE.record("pack", time.perf_counter_ns() - t)
@@ -387,6 +593,20 @@ async def send_packed(
     STATE.record("total", time.perf_counter_ns() - t_total)
     STATE.last_send_ts = time.monotonic()
     return {}
+
+
+async def send_packed(
+    profile: Profile, connection_id: str, message: Union[bytes, Any]
+) -> dict:
+    """Fast-path pack+deliver for arbitrary DIDComm plaintext (or AgentMessage)."""
+    t_total = time.perf_counter_ns()
+    if STATE.first_send_ts is None:
+        STATE.first_send_ts = time.monotonic()
+
+    t = time.perf_counter_ns()
+    body = serialize_agent_message(message)
+    STATE.record("build", time.perf_counter_ns() - t)
+    return await _pack_and_deliver(profile, connection_id, body, t_total=t_total)
 
 
 async def send_agent_message(
@@ -399,39 +619,14 @@ async def send_agent_message(
 async def send_basicmessage(
     profile: Profile, connection_id: str, content: str
 ) -> dict:
-    """Fast-path send: resolve (cached) -> build basicmessage -> pack -> deliver."""
+    """Fast-path send: resolve (cached) → build basicmessage → pack → deliver."""
     t_total = time.perf_counter_ns()
     if STATE.first_send_ts is None:
         STATE.first_send_ts = time.monotonic()
-
-    target = await resolve_target(profile, connection_id)
 
     t = time.perf_counter_ns()
     body = build_basicmessage(
         content, use_new_prefix=bool(profile.settings.get("emit_new_didcomm_prefix"))
     )
     STATE.record("build", time.perf_counter_ns() - t)
-
-    t = time.perf_counter_ns()
-    packed = await asyncio.get_event_loop().run_in_executor(
-        _PACK_POOL, pack_for_target, body, target
-    )
-    STATE.record("pack", time.perf_counter_ns() - t)
-
-    t = time.perf_counter_ns()
-    mime = (
-        DIDCOMM_V1_MIME
-        if profile.settings.get("emit_new_didcomm_mime_type")
-        else DIDCOMM_V0_MIME
-    )
-    endpoint = deliver_override_endpoint() or target.endpoint
-    async with STATE.http().post(
-        endpoint, data=packed, headers={"Content-Type": mime}
-    ) as resp:
-        if resp.status < 200 or resp.status > 299:
-            raise RuntimeError(f"Delivery failed: HTTP {resp.status} {resp.reason}")
-    STATE.record("deliver", time.perf_counter_ns() - t)
-
-    STATE.record("total", time.perf_counter_ns() - t_total)
-    STATE.last_send_ts = time.monotonic()
-    return {}
+    return await _pack_and_deliver(profile, connection_id, body, t_total=t_total)

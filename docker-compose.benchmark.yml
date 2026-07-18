@@ -50,6 +50,10 @@ services:
         --web-host 0.0.0.0 --web-port 8089
 
   issuer:
+    build:
+      context: ./instance-configs/acapy-agent
+      dockerfile: ${ISSUER_DOCKERFILE:-./docker/Dockerfile}
+    image: ${ISSUER_IMAGE_NAME:-acapy-cache-redis}
     cap_add:
       - SYS_PTRACE
     security_opt:
@@ -62,9 +66,14 @@ services:
       ACAPY_USE_REDIS: ${ACAPY_USE_REDIS:-1}
       ACAPY_WALLET_STORAGE_CONFIG: ${ACAPY_WALLET_STORAGE_CONFIG:-}
       ACAPY_WALLET_STORAGE_CREDS: ${ACAPY_WALLET_STORAGE_CREDS}
+      # Kanon storage backend (only used by the kanon-* profiles / Dockerfile.kanon).
+      KANON_STORAGE_DATABASE_URL: ${KANON_STORAGE_DATABASE_URL:-}
+      KANON_STORAGE_MASTER_KEY: ${KANON_STORAGE_MASTER_KEY:-}
+      KANON_STORAGE_AUTO_MIGRATE: ${KANON_STORAGE_AUTO_MIGRATE:-}
       FASTPATH_DELIVER_OVERRIDE: ${FASTPATH_DELIVER_OVERRIDE:-}
       FASTPATH_PACK_WORKERS: ${FASTPATH_PACK_WORKERS:-32}
-      FASTPATH_CACHE_TTL: ${FASTPATH_CACHE_TTL:-300}
+      FASTPATH_CACHE_TTL: ${FASTPATH_CACHE_TTL:-30}
+      FASTPATH_CACHE_MAX: ${FASTPATH_CACHE_MAX:-8192}
     volumes:
       - ./instance-configs/acapy-agent/configs:/home/aries/configs:ro,z
       - issuer-askar-sqlite:/home/aries/.aries_cloudagent
@@ -83,6 +92,16 @@ services:
         if [ "$${ACAPY_USE_REDIS}" = "1" ]; then
           ARGS+=(--plugin-config-value "redis_cache.connection=redis://redis-host:6379/0")
           ARGS+=(--plugin-config-value "redis_cache.max_connections=90")
+        fi
+        # Kanon storage: auto_migrate has no env fallback in from_settings, so
+        # its settings must arrive as plugin-config-values (database_url and
+        # master_key also honour env, but pass all three for robustness).
+        if [ -n "$${KANON_STORAGE_DATABASE_URL:-}" ]; then
+          ARGS+=(--plugin-config-value "kanon_storage.database_url=$${KANON_STORAGE_DATABASE_URL}")
+          ARGS+=(--plugin-config-value "kanon_storage.auto_migrate=true")
+          if [ -n "$${KANON_STORAGE_MASTER_KEY:-}" ]; then
+            ARGS+=(--plugin-config-value "kanon_storage.master_key=$${KANON_STORAGE_MASTER_KEY}")
+          fi
         fi
         exec aca-py "$${ARGS[@]}"
 

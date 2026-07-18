@@ -17,15 +17,14 @@ Env:
 
 - `FASTPATH_DELIVER_OVERRIDE` — redirect HTTP deliver to a sink (e.g. `http://mock-holder:8090/`)
 - `FASTPATH_PACK_WORKERS` — pack thread pool size (default 32)
-- `FASTPATH_CACHE_TTL` — cached-target age checked on access (default 300; `0` disables)
+- `FASTPATH_CACHE_TTL` — absolute entry age in seconds (default **30**; `0` disables); lazy + ~1s active sweep
+- `FASTPATH_CACHE_MAX` — max cached targets, LRU (default 8192; `0` unbounded); size by peak concurrent active connections, not total
 
-Cache invalidation: any `connections` record event (update, DID rotation, deletion) evicts
-that connection's cached target via an event-bus subscription. TTL expiry is currently lazy:
-an active entry refreshes on its first access after the TTL, but an idle entry is not actively
-removed. A 1.6.0 sweep (300/60/30/10 s, 10k messages) found no measurable throughput regression
-at 10 s; see the report §7.
+Cache key = `(local_tenant_wallet_id, connection_id)` — `wallet_id` is *our* ACA-Py
+tenant subwallet, not the remote peer. Hardening: ConnRecord eviction, active TTL,
+LRU, `invalidate_wallet` / `acapy::didcomm_fastpath::wallet_removed`, disposal metrics.
 
 See [`docs/REPLICATE_THROUGHPUT.md`](../../../../docs/REPLICATE_THROUGHPUT.md) and
 [`docs/ACAPY_THROUGHPUT_REPORT.md`](../../../../docs/ACAPY_THROUGHPUT_REPORT.md).
 
-Production-shaped copy (CRMS): `digicred-crms` branch `feat/didcomm-fastpath-plugin`.
+Production-shaped copy (CRMS): `digicred-crms` plugin `didcomm_fastpath`.

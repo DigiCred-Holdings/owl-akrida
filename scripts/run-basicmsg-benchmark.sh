@@ -65,9 +65,15 @@ ACAPY_ARG_FILE=${ACAPY_ARG_FILE:-issuer-benchmark.yml}
 ACAPY_USE_REDIS=${ACAPY_USE_REDIS:-1}
 ACAPY_WALLET_STORAGE_CONFIG=${wallet_cfg}
 ACAPY_WALLET_STORAGE_CREDS=${wallet_creds}
+ISSUER_DOCKERFILE=${ISSUER_DOCKERFILE:-./docker/Dockerfile}
+ISSUER_IMAGE_NAME=${ISSUER_IMAGE_NAME:-acapy-cache-redis}
+KANON_STORAGE_DATABASE_URL=${KANON_STORAGE_DATABASE_URL:-}
+KANON_STORAGE_MASTER_KEY=${KANON_STORAGE_MASTER_KEY:-}
+KANON_STORAGE_AUTO_MIGRATE=${KANON_STORAGE_AUTO_MIGRATE:-}
 FASTPATH_DELIVER_OVERRIDE=${FASTPATH_DELIVER_OVERRIDE:-}
 FASTPATH_PACK_WORKERS=${FASTPATH_PACK_WORKERS:-32}
-FASTPATH_CACHE_TTL=${FASTPATH_CACHE_TTL:-300}
+FASTPATH_CACHE_TTL=${FASTPATH_CACHE_TTL:-30}
+FASTPATH_CACHE_MAX=${FASTPATH_CACHE_MAX:-8192}
 RUN_NAME=${RUN_NAME:-manual}
 EOF
 }
@@ -138,7 +144,15 @@ profile_env() {
   LOCUST_SPAWN_RATE=5
   FASTPATH_DELIVER_OVERRIDE=""
   FASTPATH_PACK_WORKERS=32
-  FASTPATH_CACHE_TTL="${FASTPATH_CACHE_TTL:-300}"
+  FASTPATH_CACHE_TTL="${FASTPATH_CACHE_TTL:-30}"
+  FASTPATH_CACHE_MAX="${FASTPATH_CACHE_MAX:-8192}"
+  # Storage backend selection (default = stock Askar image). Kanon profiles
+  # override these to build/run the Dockerfile.kanon image.
+  ISSUER_DOCKERFILE="./docker/Dockerfile"
+  ISSUER_IMAGE_NAME="acapy-cache-redis"
+  KANON_STORAGE_DATABASE_URL=""
+  KANON_STORAGE_MASTER_KEY=""
+  KANON_STORAGE_AUTO_MIGRATE=""
 
   case "$name" in
     direct-1x20|direct-1x20-r2)
@@ -233,6 +247,41 @@ profile_env() {
       ACAPY_WALLET_STORAGE_CONFIG='{"url":"issuer-db:5432","max_connections":30}'
       MEASURE_MODE=fastpath
       ;;
+    kanon-fastpath-admin-sink|kanon-fastpath-admin-sink-*)
+      # Kanon storage backend; real Credo connections for keys; deliver to
+      # mock-holder (isolates the issuer's own ceiling). Compare vs
+      # fastpath-pg-admin-sink (stock Askar).
+      LOCUST_USERS="${LOCUST_USERS_OVERRIDE:-20}"
+      CONNECTIONS_PER_AGENT=1
+      ACAPY_ARG_FILE=issuer-isolated-kanon-fastpath.yml
+      ACAPY_USE_REDIS=0
+      ACAPY_WALLET_STORAGE_CONFIG=
+      ACAPY_CLEAR_WALLET_STORAGE_CONFIG=1
+      MEASURE_MODE=fastpath_admin
+      FASTPATH_DELIVER_OVERRIDE=http://mock-holder:8090/
+      FASTPATH_PACK_WORKERS="${FASTPATH_PACK_WORKERS:-32}"
+      ISSUER_DOCKERFILE="./docker/Dockerfile.kanon"
+      ISSUER_IMAGE_NAME="acapy-kanon-benchmark"
+      KANON_STORAGE_DATABASE_URL="postgresql+asyncpg://test:test@issuer-db:5432/test"
+      KANON_STORAGE_MASTER_KEY="0123456789abcdef0123456789abcdef"
+      KANON_STORAGE_AUTO_MIGRATE=true
+      ;;
+    kanon-fastpath-e2e|kanon-fastpath-e2e-*)
+      # Kanon storage backend; real Credo holders end-to-end. Compare vs
+      # fastpath-pg-e2e (stock Askar).
+      LOCUST_USERS="${LOCUST_USERS_OVERRIDE:-20}"
+      CONNECTIONS_PER_AGENT=1
+      ACAPY_ARG_FILE=issuer-isolated-kanon-fastpath.yml
+      ACAPY_USE_REDIS=0
+      ACAPY_WALLET_STORAGE_CONFIG=
+      ACAPY_CLEAR_WALLET_STORAGE_CONFIG=1
+      MEASURE_MODE=fastpath
+      ISSUER_DOCKERFILE="./docker/Dockerfile.kanon"
+      ISSUER_IMAGE_NAME="acapy-kanon-benchmark"
+      KANON_STORAGE_DATABASE_URL="postgresql+asyncpg://test:test@issuer-db:5432/test"
+      KANON_STORAGE_MASTER_KEY="0123456789abcdef0123456789abcdef"
+      KANON_STORAGE_AUTO_MIGRATE=true
+      ;;
     *)
       echo "Unknown profile: $name" >&2
       return 1
@@ -244,7 +293,9 @@ profile_env() {
     ACAPY_WALLET_STORAGE_CONFIG ACAPY_CLEAR_WALLET_STORAGE_CONFIG \
     ACAPY_ARG_FILE ACAPY_USE_REDIS MEASURE_MODE \
     WITH_MEDIATION MEDIATION_URL \
-    FASTPATH_DELIVER_OVERRIDE FASTPATH_PACK_WORKERS
+    FASTPATH_DELIVER_OVERRIDE FASTPATH_PACK_WORKERS \
+    ISSUER_DOCKERFILE ISSUER_IMAGE_NAME \
+    KANON_STORAGE_DATABASE_URL KANON_STORAGE_MASTER_KEY KANON_STORAGE_AUTO_MIGRATE
 }
 
 wait_issuer() {
@@ -315,8 +366,13 @@ cmd_run() {
     echo "acapy_use_redis=$ACAPY_USE_REDIS"
     echo "acapy_log_level=$ACAPY_LOG_LEVEL"
     echo "wallet_storage_config=${ACAPY_WALLET_STORAGE_CONFIG:-sqlite-default}"
+    echo "issuer_dockerfile=${ISSUER_DOCKERFILE:-./docker/Dockerfile}"
+    echo "storage_backend=$([[ -n "${KANON_STORAGE_DATABASE_URL:-}" ]] && echo kanon || echo askar)"
+    echo "kanon_database_url=${KANON_STORAGE_DATABASE_URL:-}"
     echo "fastpath_deliver_override=${FASTPATH_DELIVER_OVERRIDE:-}"
     echo "fastpath_pack_workers=${FASTPATH_PACK_WORKERS:-}"
+    echo "fastpath_cache_ttl=${FASTPATH_CACHE_TTL:-}"
+    echo "fastpath_cache_max=${FASTPATH_CACHE_MAX:-}"
     echo "message_to_send=$MESSAGE_TO_SEND"
     echo "payload_bytes=$(printf '%s' "$MESSAGE_TO_SEND" | wc -c)"
     echo "issuer_image=$(docker compose -p "$PROJECT" images issuer 2>/dev/null | awk 'NR==2{print $2":"$3}')"

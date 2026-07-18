@@ -51,8 +51,10 @@ concurrency — i.e. the remaining ceiling is concurrency/downstream, not ACA-Py
 ## Caveats (benchmark-grade, not production-grade)
 
 - ~~Target cache is not invalidated on DID rotation / connection deletion.~~ Now handled:
-  any `connections` record event evicts that entry, plus a `FASTPATH_CACHE_TTL` fallback
-  (default 300 s; `0` disables). `DELETE /didcomm-fastpath/cache` still clears manually.
+  ConnRecord events (scoped by local tenant wallet_id), active `FASTPATH_CACHE_TTL`
+  (default **30** s), LRU (`FASTPATH_CACHE_MAX`, default 8192), and
+  `invalidate_wallet` on tenant removal. `DELETE /didcomm-fastpath/cache` still
+  clears manually.
 - No BasicMessage record persistence or webhook emission on the send side.
 - Mediator forward-wrapping is implemented but has not been benchmarked yet.
 - Sealed-sender blob reuse is protocol-valid (it only conveys the sender verkey) but differs from

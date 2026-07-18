@@ -1,0 +1,33 @@
+# Kanon-storage issuer image for the basic-message benchmark.
+#
+# Same base as docker/Dockerfile (ACA-Py py3.13-1.6.0) but swaps the wallet
+# backend to the kanon_storage plugin (SQLAlchemy 2.0 + asyncpg) instead of
+# stock Askar. Used to measure whether the didcomm_fastpath ceiling holds when
+# storage is Kanon. Installs run as the base image's default user so packages
+# land in ~/.local (matching the fast-path live-mount in the compose overlay).
+ARG ACAPY_IMAGE=ghcr.io/openwallet-foundation/acapy-agent:py3.13-1.6.0
+FROM ${ACAPY_IMAGE}
+
+RUN pip install 'py-spy==0.4.1'
+
+# kanon_storage runtime deps not in the base image (mirrors the CRMS deploy
+# image's storage stack; web3/vaults/signing extras are omitted since we only
+# install kanon_storage here).
+RUN pip install \
+      "sqlalchemy[asyncio]>=2.0,<3" \
+      "alembic>=1.13,<2" \
+      "asyncpg>=0.30,<0.31" \
+      "aiosqlite>=0.20,<0.21"
+
+# Fast-path DIDComm send plugin (local source, same as the Askar image).
+COPY --chown=aries:aries ./plugins/didcomm_fastpath /tmp/didcomm_fastpath
+RUN pip install /tmp/didcomm_fastpath
+
+# Kanon storage backend (--no-deps: its pinned deps would re-resolve ACA-Py).
+COPY --chown=aries:aries ./plugins/kanon_storage /tmp/kanon_storage
+RUN pip install --no-deps /tmp/kanon_storage
+
+USER $user
+
+ENTRYPOINT ["/bin/bash", "-c", "aca-py \"$@\"", "--"]
+CMD ["start", "--arg-file", "default.yml"]

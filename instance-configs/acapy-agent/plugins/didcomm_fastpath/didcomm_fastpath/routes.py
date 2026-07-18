@@ -12,7 +12,7 @@ from aiohttp import web
 
 from acapy_agent.admin.request_context import AdminRequestContext
 
-from .core import STATE, send_basicmessage
+from .core import STATE, send_basicmessage, wallet_id_for_profile
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,10 +47,19 @@ async def fastpath_stats_reset(request: web.BaseRequest):
 
 
 async def fastpath_cache_clear(request: web.BaseRequest):
-    """Drop all cached connection targets (e.g. after DID rotation)."""
-    n = len(STATE.targets)
-    STATE.targets.clear()
-    return web.json_response({"cleared": n})
+    """Drop cached targets for this tenant, or all for base wallet."""
+    context: AdminRequestContext = request["context"]
+    q_wallet = request.rel_url.query.get("wallet_id")
+    if q_wallet:
+        n = STATE.clear(wallet_id=q_wallet)
+        return web.json_response({"cleared": n, "wallet_id": q_wallet})
+
+    wallet_id = wallet_id_for_profile(context.profile)
+    if wallet_id == "base" and not context.profile.settings.get("wallet.id"):
+        n = STATE.clear()
+        return web.json_response({"cleared": n, "wallet_id": None})
+    n = STATE.clear(wallet_id=wallet_id)
+    return web.json_response({"cleared": n, "wallet_id": wallet_id})
 
 
 async def register(app: web.Application):

@@ -122,10 +122,46 @@ TTL on the real-Credo admin path (10k messages, 20 connections):
 All runs had zero failures. Throughput stayed within a ~2% band, so **10-second refreshes caused
 no measurable regression** in this test despite 11× more cold resolves than the 300-second run.
 
-Security caveat: the current TTL is checked **lazily on access**. It refreshes an active
-connection after the configured age, but does not actively remove an idle entry. A true
-10-second retention bound requires timer/background eviction; merely changing the setting does
-not provide that guarantee.
+Default is now **30 seconds** (the sweep shows anything in this range is performance-safe;
+30 s keeps connections warm across multi-step flows) with **active ~1s background eviction**
+(plus lazy check on access), cache keys scoped as `(local_tenant_wallet_id, connection_id)` —
+where `wallet_id` is *our* ACA-Py tenant subwallet, not the remote peer — and an LRU cap
+(`FASTPATH_CACHE_MAX`, default 8192; size by peak concurrent active connections, not total).
+Idle entries no longer linger past the TTL.
+
+### Post-hardening verification (TTL=30, MAX=8192)
+
+After adding tenant-scoped keys, active TTL, LRU bounds, key-handle disposal, and the
+wallet-removal hook, the full 10k matrix was re-run with the new defaults — **no regression**:
+
+| Path | Steady msg/s | Failures | Cache signal |
+|---|---:|---:|---|
+| Fast-path e2e (real Credo, 20 conns) | **102.3** | 0 | `evictions_lru=0`, `expirations_ttl` fired on idle |
+| Fast-path mock sink (20 conns) | **227.3** | 0 | drained to 0 entries after idle via active sweep |
+
+Both reproduce §5/§6 within noise, confirming the hardening (tenant isolation + bounded,
+self-draining cache) costs nothing in throughput. `cache_entries` stayed at 20 (≪ 8192, so LRU
+never triggered), and after traffic stopped the background sweeper reclaimed every idle entry and
+its `sender_xk` within the 30 s TTL — the intended behavior for bursty/idle holders.
+
+### Kanon storage backend (TTL=30, MAX=8192)
+
+The prior numbers use stock Askar. To check whether the fast-path ceiling depends on the storage
+backend, the same 10k matrix was re-run against **`kanon_storage`** (SQLAlchemy 2.0 + asyncpg,
+`wallet-type: kanon-storage-anoncreds`) instead of Askar — same base image (ACA-Py `py3.13-1.6.0`),
+same fast-path plugin, same Postgres:
+
+| Path | Askar | Kanon | Δ | Failures |
+|---|---:|---:|---:|---:|
+| Fast-path mock sink (issuer ceiling, 20 conns) | 227.3 | **204.4** | −10% | 0 |
+| Fast-path e2e (real Credo, 20 conns) | 102.3 | **97.1** | −5% | 0 |
+
+Kanon holds fast-path throughput within a small margin of Askar (the e2e path is still bounded by
+the co-located Credo holders, not storage). Cache behaviour was identical — `cache_entries=20`,
+`evictions_lru=0`, and the active TTL sweep drained idle entries (`expirations_ttl` fired) — and
+schema bootstrap (`auto_migrate`, 5 tables) plus fast-path resolve/pack worked unchanged over the
+Kanon-backed wallet. Reproduce with the `kanon-fastpath-admin-sink` / `kanon-fastpath-e2e`
+profiles (Dockerfile `docker/Dockerfile.kanon`).
 
 ---
 
@@ -133,7 +169,8 @@ not provide that guarantee.
 
 **Know (measured on 1.6.0):** the ~58–70 stock ceiling and its cause (per-send Askar/FFI + event
 loop, not storage/mediator/crypto); the fast path's ~1.35–1.5× lift at lower CPU/msg with an
-identical wire format; a single-process ceiling of ~242 msg/s with a cheap recipient.
+identical wire format; a single-process ceiling of ~242 msg/s with a cheap recipient; the fast
+path holds within ~5–10% on the Kanon (SQLAlchemy) storage backend (§7).
 
 **Don't (open):**
 - **Absolute ceiling on dedicated hardware** — even sink runs co-locate the load generator; a
@@ -142,10 +179,9 @@ identical wire format; a single-process ceiling of ~242 msg/s with a cheap recip
   percentages as shares, not exact.
 - **Horizontal scaling linearity** — expected ~N×~240 behind shared Postgres, not yet measured.
 - **Real mediated wallets** differ from local Credo holders; our numbers bound the *issuer*.
-- **Production hardening of the plugin** — event-bus invalidation is done, but TTL expiry is
-  currently lazy; active expiry and best-effort key-handle disposal are still needed for a
-  bounded retention claim. Send-side BasicMessage persistence/webhooks and mediator
-  forward-wrapping also remain untested.
+- **Remaining plugin gaps** — send-side BasicMessage persistence/webhooks and mediator
+  forward-wrapping remain untested. Cache isolation, active TTL, LRU, wallet-removal hook,
+  and Key disposal are in place and load-verified (§7).
 
 ---
 
@@ -157,8 +193,9 @@ identical wire format; a single-process ceiling of ~242 msg/s with a cheap recip
   pool pressure.
 - **For a clean absolute number:** rerun §6 with the load generator on a separate host (or
   `cpuset`-pin the issuer).
-- **Key retention:** implement active absolute expiry, then use a **10-second default**; the TTL
-  sweep found no measurable throughput or latency penalty at 10 seconds.
+- **Key retention:** default **30-second active TTL** + LRU + tenant-scoped keys; the TTL
+  sweep found no measurable throughput or latency penalty even at 10 seconds, so tighten
+  the TTL freely if a shorter secret-retention window is required.
 - **Deeper single-process gains (only if needed):** ECDH shared-secret cache inside pack; tune
   `FASTPATH_PACK_WORKERS`.
 
@@ -182,6 +219,10 @@ bash scripts/run-basicmsg-benchmark.sh run fastpath-pg-e2e
 for n in 20 40 60; do
   LOCUST_USERS_OVERRIDE=$n bash scripts/run-basicmsg-benchmark.sh run fastpath-pg-admin-sink-$n
 done
+
+# Kanon storage backend (§7) — expect ~204 sink / ~97 e2e, on par with Askar
+bash scripts/run-basicmsg-benchmark.sh run kanon-fastpath-admin-sink
+bash scripts/run-basicmsg-benchmark.sh run kanon-fastpath-e2e
 
 # live per-stage timings
 curl -s localhost:8150/didcomm-fastpath/stats | python3 -m json.tool

@@ -1,0 +1,29 @@
+label: IssuerIsolatedKanonFastpath
+wallet-name: issuer-isolated-kanon
+inbound-transport:
+  - [http, 0.0.0.0, 8151]
+admin: [0.0.0.0, 8150]
+
+# Stripped for ACA-Py isolation: no Redis plugin, no ledger
+no-ledger: true
+
+outbound-transport: http
+emit-new-didcomm-prefix: true
+
+auto-accept-invites: true
+auto-accept-requests: true
+auto-ping-connection: false
+public-invites: true
+
+preserve-exchange-records: false
+
+# Kanon storage backend (SQLAlchemy 2.0 + asyncpg) instead of stock Askar.
+# DB URL + 32-byte master key are supplied via KANON_STORAGE_* env vars.
+wallet-type: kanon-storage-anoncreds
+wallet-key: "insecure, for use in demo only"
+auto-provision: true
+
+# Experimental fast-path send pipeline + Kanon storage plugin
+plugin:
+  - didcomm_fastpath
+  - kanon_storage.v1_0
