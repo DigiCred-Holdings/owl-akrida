@@ -86,6 +86,10 @@ per-send Askar session, no outbound-queue round-trip.
 ~1.35× (admin) / ~1.5× (e2e) more throughput at **lower CPU per message**, wire-valid (holders
 received and validated every message e2e).
 
+> These figures are **bounded by local host resources, not by ACA-Py.** The issuer sits at ~1 core
+> while the co-located Credo holders saturate the box (they do ~10× the issuer's CPU work per
+> message), so ~94–105 is the load generator's limit here — see §6 for the issuer's true ceiling.
+
 ## 6. How far one process really goes — mock-holder sink
 
 Real-holder numbers are **rig-limited**: co-located Credo holders do ~10× the issuer's CPU work
