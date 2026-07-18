@@ -4,7 +4,7 @@
 **Harness:** Owl Akrida (`benchmark/basic-msg-10k` branch) + local benchmark overlay
 **Issuer under test:** ACA-Py `py3.12-1.3.0` (Askar wallet)
 **Host (reference runs):** 12 vCPU, ~16 GB RAM, Docker on WSL2
-**Author:** DigiCred engineering
+**Author:** Patrick St-Louis
 **Replication guide:** [`REPLICATE_THROUGHPUT.md`](./REPLICATE_THROUGHPUT.md)
 **Related docs:** [`throughput/CONCLUSIONS.md`](./throughput/CONCLUSIONS.md) · [`throughput/ISOLATION_CONCLUSIONS.md`](./throughput/ISOLATION_CONCLUSIONS.md) · [`throughput/FASTPATH.md`](./throughput/FASTPATH.md)
 
