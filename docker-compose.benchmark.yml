@@ -64,12 +64,14 @@ services:
       ACAPY_WALLET_STORAGE_CREDS: ${ACAPY_WALLET_STORAGE_CREDS}
       FASTPATH_DELIVER_OVERRIDE: ${FASTPATH_DELIVER_OVERRIDE:-}
       FASTPATH_PACK_WORKERS: ${FASTPATH_PACK_WORKERS:-32}
+      FASTPATH_CACHE_TTL: ${FASTPATH_CACHE_TTL:-300}
     volumes:
       - ./instance-configs/acapy-agent/configs:/home/aries/configs:ro,z
       - issuer-askar-sqlite:/home/aries/.aries_cloudagent
       - ./results:/results
       # Live-mount so plugin changes apply without image rebuild.
-      - ./instance-configs/acapy-agent/plugins/didcomm_fastpath/didcomm_fastpath:/home/aries/.local/lib/python3.12/site-packages/didcomm_fastpath:ro
+      # NOTE: python3.13 matches the py3.13-1.6.0 base image in the Dockerfile.
+      - ./instance-configs/acapy-agent/plugins/didcomm_fastpath/didcomm_fastpath:/home/aries/.local/lib/python3.13/site-packages/didcomm_fastpath:ro
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |

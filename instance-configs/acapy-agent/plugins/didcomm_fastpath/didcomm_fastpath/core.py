@@ -8,8 +8,11 @@ the per-send sender-key fetch, and the per-send Ed25519->X25519 conversions.
 Every message still gets a fresh CEK, fresh nonces, and a fresh AEAD pass, so
 wire messages remain protocol-valid DIDComm v1 envelopes.
 
-Known limitation (acceptable for benchmarking): the cache is not invalidated
-on DID rotation or connection deletion. Use DELETE /didcomm-fastpath/cache.
+Cache invalidation: any ConnRecord event (update, DID rotation, deletion)
+evicts that connection's cache entry via an event-bus subscription (see
+__init__.setup), and entries expire after FASTPATH_CACHE_TTL seconds
+(default 300, 0 disables) as a fallback. DELETE /didcomm-fastpath/cache
+still clears everything manually.
 """
 
 import asyncio
@@ -59,6 +62,7 @@ class CachedTarget:
     routing_verkeys: List[str]
     sender_vk_b: bytes  # base58 sender verkey, utf-8 encoded
     sender_xk: Key  # sender X25519 keypair (independent handle)
+    cached_at: float = 0.0  # time.monotonic() at cache insert, for TTL expiry
 
 
 @dataclass
@@ -119,6 +123,10 @@ class FastpathState:
         self.first_send_ts = None
         self.last_send_ts = None
 
+    def invalidate(self, connection_id: str) -> bool:
+        """Drop one connection's cached target (DID rotation, deletion, etc.)."""
+        return self.targets.pop(connection_id, None) is not None
+
     def http(self) -> ClientSession:
         if self._http is None or self._http.closed:
             self._http = ClientSession(
@@ -134,6 +142,18 @@ _PACK_POOL = ThreadPoolExecutor(
     max_workers=int(os.environ.get("FASTPATH_PACK_WORKERS", "32")),
     thread_name_prefix="fastpath-pack",
 )
+
+
+def cache_ttl_seconds() -> float:
+    """TTL for cached targets; fallback safety net behind event-bus eviction.
+
+    0 (or negative) disables expiry — useful for benchmarks where the extra
+    resolve would skew steady-state numbers.
+    """
+    try:
+        return float(os.environ.get("FASTPATH_CACHE_TTL", "300"))
+    except ValueError:
+        return 300.0
 
 
 def deliver_override_endpoint() -> Optional[str]:
@@ -166,7 +186,10 @@ async def resolve_target(profile: Profile, connection_id: str) -> CachedTarget:
     """Resolve and cache all send material for a connection (cold path)."""
     cached = STATE.targets.get(connection_id)
     if cached:
-        return cached
+        ttl = cache_ttl_seconds()
+        if ttl <= 0 or (time.monotonic() - cached.cached_at) < ttl:
+            return cached
+        STATE.invalidate(connection_id)
 
     start = time.perf_counter_ns()
     conn_mgr = profile.inject(BaseConnectionManager)
@@ -197,6 +220,7 @@ async def resolve_target(profile: Profile, connection_id: str) -> CachedTarget:
         routing_verkeys=list(target.routing_keys or []),
         sender_vk_b=sender_vk_b,
         sender_xk=sender_xk,
+        cached_at=time.monotonic(),
     )
     STATE.targets[connection_id] = cached
     STATE.record("resolve_cold", time.perf_counter_ns() - start)

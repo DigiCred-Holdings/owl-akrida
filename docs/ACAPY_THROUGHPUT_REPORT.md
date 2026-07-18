@@ -2,7 +2,8 @@
 
 **Status:** complete for the questions posed; open items listed in §9
 **Harness:** Owl Akrida (`benchmark/basic-msg-10k` branch) + local benchmark overlay
-**Issuer under test:** ACA-Py `py3.12-1.3.0` (Askar wallet)
+**Issuer under test:** ACA-Py `py3.12-1.3.0` (Askar wallet); harness since re-based on
+`py3.13-1.6.0` and re-verified (see §9 note)
 **Host (reference runs):** 12 vCPU, ~16 GB RAM, Docker on WSL2
 **Author:** Patrick St-Louis
 **Replication guide:** [`REPLICATE_THROUGHPUT.md`](./REPLICATE_THROUGHPUT.md)
@@ -233,9 +234,11 @@ Benchmark-only aids: `FASTPATH_DELIVER_OVERRIDE` redirects the delivery HTTP hop
    rig-limited; a **remote load generator or CPU-pinned issuer** is needed for a clean number.
 2. **Why 80 holders regressed** (195 vs 207). Likely host CPU contention from idle-but-warm Credo
    processes, but not isolated.
-3. **Production-safety of the plugin is unproven.** Not yet handled: cache invalidation on DID
-   rotation / connection deletion; BasicMessage record persistence and send-side webhooks;
-   load-tested mediator forward-wrapping (implemented, untested); multi-recipient packing.
+3. **Production-safety of the plugin is partially addressed.** Cache invalidation is now
+   implemented (event-bus eviction on any `connections` record event — update, DID rotation,
+   deletion — plus a `FASTPATH_CACHE_TTL` fallback, default 300 s) and verified against a live
+   delete. Still open: BasicMessage record persistence and send-side webhooks; load-tested
+   mediator forward-wrapping (implemented, untested); multi-recipient packing.
 4. **Real-recipient throughput at scale.** Production recipients (mobile wallets via a mediator)
    have a very different profile than local Credo holders; our numbers bound the **issuer**, not a
    full mediated delivery path.
@@ -247,6 +250,13 @@ Benchmark-only aids: `FASTPATH_DELIVER_OVERRIDE` redirects the delivery HTTP hop
 7. **py-spy native sampling had reliability warnings**; the crypto-vs-FFI split in §6.3 is
    approximate, not exact.
 8. **Payload size effect** — all runs used a 4-byte payload; larger bodies were not tested.
+
+> **ACA-Py 1.6.0 note.** After the report's reference runs, the harness base image was bumped to
+> `py3.13-1.6.0` (1.6.0 ships on Python 3.13; there is no py3.12 tag). All plugin internals the
+> fast path relies on are unchanged, and a 10k fastpath e2e re-run on 1.6.0 completed cleanly
+> (~111 msg/s steady-state with 20 real Credo holders on this host — same order as the 1.3.0
+> numbers; run-to-run host load explains the delta). The reference tables above were **not**
+> re-measured on 1.6.0.
 
 ---
 
@@ -337,7 +347,8 @@ bash scripts/run-basicmsg-benchmark.sh reset    # remove volumes
 - Keep Redis for connection-setup pool pressure; it does not lift the steady-state ceiling.
 
 **To productionize `didcomm_fastpath`:**
-- Add cache invalidation on DID rotation / connection deletion (hook or TTL).
+- ~~Add cache invalidation on DID rotation / connection deletion (hook or TTL).~~ **Done** —
+  event-bus eviction on `connections` record events + `FASTPATH_CACHE_TTL` (default 300 s).
 - Restore send-side BasicMessage persistence + webhook if consumers depend on them.
 - Load-test mediator forward-wrapping and multi-recipient packing.
 

@@ -17,6 +17,10 @@ Env:
 
 - `FASTPATH_DELIVER_OVERRIDE` — redirect HTTP deliver to a sink (e.g. `http://mock-holder:8090/`)
 - `FASTPATH_PACK_WORKERS` — pack thread pool size (default 32)
+- `FASTPATH_CACHE_TTL` — cached-target expiry in seconds (default 300; `0` disables)
+
+Cache invalidation: any `connections` record event (update, DID rotation, deletion) evicts
+that connection's cached target via an event-bus subscription; TTL is the fallback.
 
 See [`docs/REPLICATE_THROUGHPUT.md`](../../../../docs/REPLICATE_THROUGHPUT.md) and
 [`docs/ACAPY_THROUGHPUT_REPORT.md`](../../../../docs/ACAPY_THROUGHPUT_REPORT.md).

@@ -101,7 +101,7 @@ bash scripts/run-basicmsg-benchmark.sh reset   # remove volumes
 | Compose base | `docker-compose.demo.yml` |
 | Benchmark overlay | `docker-compose.benchmark.yml` |
 | Env defaults | `sample.benchmark.env` |
-| Issuer image | `instance-configs/acapy-agent/docker/Dockerfile` (ACA-Py 1.3.0 + redis cache + `py-spy` + `didcomm_fastpath`) |
+| Issuer image | `instance-configs/acapy-agent/docker/Dockerfile` (ACA-Py 1.6.0 on py3.13 + redis cache + `py-spy` + `didcomm_fastpath`) |
 | Fast-path plugin | `instance-configs/acapy-agent/plugins/didcomm_fastpath/` |
 | Mock holder sink | `mock-holder/` |
 | Locust scenario | `load-agent/locust-files/locustBasicMsgBenchmark.py` |
