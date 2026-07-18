@@ -2,8 +2,8 @@
 
 **Status:** complete for the questions posed; open items listed in §9
 **Harness:** Owl Akrida (`benchmark/basic-msg-10k` branch) + local benchmark overlay
-**Issuer under test:** ACA-Py `py3.12-1.3.0` (Askar wallet); harness since re-based on
-`py3.13-1.6.0` and re-verified (see §9 note)
+**Issuer under test:** headline findings (§1) measured on ACA-Py `py3.13-1.6.0` (Askar wallet);
+the deep-dive isolation tables (§§3–8) are the original `py3.12-1.3.0` reference runs (see §9 note)
 **Host (reference runs):** 12 vCPU, ~16 GB RAM, Docker on WSL2
 **Author:** Patrick St-Louis
 **Replication guide:** [`REPLICATE_THROUGHPUT.md`](./REPLICATE_THROUGHPUT.md)
@@ -18,20 +18,24 @@ messages/second**, attributed to a "serialized event loop," while a modern Credo
 reported to reach **~170 msg/s**. We reproduced the ACA-Py number independently, isolated the
 cause, built a fast-path plugin to address it, and measured the real ceiling.
 
-**Headline findings:**
+**Headline findings (all numbers below are ACA-Py `py3.13-1.6.0`, 10k messages, isolated stack —
+no Redis/mediator/ledger; the deep-dive tables in §§3–8 are the earlier 1.3.0 reference runs):**
 
-1. Stock single-process ACA-Py plateaus at **~48–55 msg/s** on basic-message send — reproduced.
+1. Stock single-process ACA-Py plateaus at **~70 msg/s** on basic-message send (admin send, real
+   Credo holders) — reproduced on 1.6.0.
 2. The limiter is **not** storage, the mediator, the holder, or the DIDComm cryptography. It is
    **per-send overhead** in ACA-Py's send pipeline (admin route, per-message `ConnRecord`
    fetch, per-message Askar session, the outbound queue/encode state machine, and repeated key
    fetch/conversions).
 3. A fast-path plugin (`didcomm_fastpath`) that caches per-connection send material — **without
-   changing the wire format or the crypto** — roughly **doubled** throughput to **~89 msg/s** at
-   **half** the CPU when sending to real Credo holders.
-4. That ~89 was a **test-rig artifact**, not the issuer's ceiling: co-located Credo holders
-   consumed 11–12 of the 12 host cores while the issuer used only ~1–1.5.
-5. With a lightweight mock recipient, one ACA-Py fast-path process reached **~170–210 msg/s**
-   (peak ~207 at 60 concurrent connections) — **matching the Credo "~170 msg/s" figure**.
+   changing the wire format or the crypto** — raised throughput to **~94 msg/s** (admin send) and
+   **~105 msg/s** end-to-end against real Credo holders, at **lower CPU per message** (issuer mean
+   ~106% CPU for 94 msg/s vs ~124% for 70 msg/s stock).
+4. That ~94–105 is a **test-rig artifact**, not the issuer's ceiling: co-located Credo holders
+   saturate the 12-core host while the issuer itself uses only ~1 core.
+5. With a lightweight mock recipient, one ACA-Py fast-path process reached **~220–242 msg/s**
+   (peak **~242 at 60 concurrent connections**, issuer ~0.8 core mean) — **exceeding the Credo
+   "~170 msg/s" figure**.
 
 ---
 
@@ -252,17 +256,25 @@ Benchmark-only aids: `FASTPATH_DELIVER_OVERRIDE` redirects the delivery HTTP hop
 8. **Payload size effect** — all runs used a 4-byte payload; larger bodies were not tested.
 
 > **ACA-Py 1.6.0 note.** After the report's reference runs, the harness base image was bumped to
-> `py3.13-1.6.0` (1.6.0 ships on Python 3.13; there is no py3.12 tag). All plugin internals the
-> fast path relies on are unchanged, and a 10k fastpath e2e re-run on 1.6.0 completed cleanly
-> (~111 msg/s steady-state with 20 real Credo holders on this host — same order as the 1.3.0
-> numbers; run-to-run host load explains the delta). The reference tables above were **not**
-> re-measured on 1.6.0.
+> `py3.13-1.6.0` (1.6.0 ships on Python 3.13; there is no py3.12 tag) and the full basic-message
+> matrix was **re-measured on 1.6.0** (10k messages each, generalized `send_packed` path). These
+> 1.6.0 numbers are what the Executive Summary (§1) now reports; the deep-dive tables in §§3–8
+> remain the original 1.3.0 reference runs and were **not** re-measured.
 >
-> **Generalized-path re-verification (final).** After the fast path was generalized to pack+deliver
-> arbitrary AgentMessages (`send_packed`, consumed by `workflow_protocol`), a further 10k fastpath
-> e2e run on 1.6.0 held at **104.9 msg/s, 0 failures** — confirming the refactor did not regress
-> the basicmessage path. Per-stage means: pack 20.1 ms, deliver 56.3 ms (Credo-holder bound),
-> total 76.9 ms. See [`throughput/FASTPATH.md`](./throughput/FASTPATH.md) "Final verification run".
+> | Profile | Path | 1.6.0 msg/s | Issuer CPU (mean) |
+> |---|---|---:|---:|
+> | `isolate-pg-admin` (stock) | admin send, real Credo | 70.0 | 124% |
+> | `fastpath-pg-admin` | fastpath send, real Credo | 94.4 | 106% |
+> | `fastpath-pg-e2e` | fastpath + Credo receipt | 104.9 | — |
+> | `fastpath-pg-admin-sink` (20 / 40 / 60) | mock recipient | 220.6 / 227.1 / 241.9 | 81% @60 |
+>
+> Stock 1.6.0 (~70 msg/s) is notably faster than stock 1.3.0 (~48 msg/s), so the fast path's
+> relative lift over stock is smaller on 1.6.0 (~1.35× admin, ~1.5× e2e) even though absolute
+> throughput is higher. The mock-sink ceiling rose to **~242 msg/s** (peak at 60 connections),
+> confirming the real-Credo runs remain load-generator bound, not issuer bound. The generalized
+> `send_packed` path (consumed by `workflow_protocol`) shows **no basicmessage regression**
+> (0 failures across all runs). See [`throughput/FASTPATH.md`](./throughput/FASTPATH.md)
+> "Final verification run".
 
 ---
 

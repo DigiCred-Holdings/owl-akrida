@@ -67,12 +67,21 @@ Artifacts: `results/basicmsg/fastpath-pg-admin/`, `results/basicmsg/fastpath-pg-
 
 After the plugin was (a) rebased on **ACA-Py 1.6.0** (py3.13) and (b) generalized so the pack
 pipeline serves arbitrary AgentMessages (`send_packed` / `send_agent_message`, used by
-`workflow_protocol`) in addition to basic messages, a 10k-message e2e run confirms **no regression
-on the basicmessage path**:
+`workflow_protocol`) in addition to basic messages, the full basic-message matrix was
+**re-measured on 1.6.0** (10k messages each, isolated stack). No regression on the basicmessage
+path (0 failures throughout):
 
-| Run | ACA-Py | Path | Messages | Steady RPS | Failures |
-|---|---|---|---:|---:|---:|
-| fastpath-pg-e2e-final | 1.6.0 | fastpath send + Credo receipt | 10,000 | **104.9** | 0 |
+| Profile | Path | ACA-Py | Steady RPS | Issuer CPU (mean) |
+|---|---|---|---:|---:|
+| isolate-pg-admin (stock) | admin send, real Credo | 1.6.0 | 70.0 | 124% |
+| fastpath-pg-admin | fastpath send, real Credo | 1.6.0 | 94.4 | 106% |
+| fastpath-pg-e2e | fastpath + Credo receipt | 1.6.0 | **104.9** | — |
+| fastpath-pg-admin-sink (20/40/60) | mock recipient | 1.6.0 | 220.6 / 227.1 / **241.9** | 81% @60 |
+
+Stock 1.6.0 (~70 msg/s) is faster than stock 1.3.0 (~48 msg/s), so the fast path's relative lift
+is smaller on 1.6.0 (~1.35× admin, ~1.5× e2e) though absolute throughput is higher. The mock-sink
+ceiling rose to **~242 msg/s** (peak at 60 connections) — the real-Credo runs remain load-generator
+bound, not issuer bound.
 
 Per-stage means (from `GET /didcomm-fastpath/stats`, 20 cached connections, `pack_workers=32`):
 
