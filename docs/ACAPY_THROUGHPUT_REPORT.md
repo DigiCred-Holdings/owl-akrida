@@ -107,7 +107,29 @@ core — so the ~94–105 seen against real holders is the load generator's limi
 
 ---
 
-## 7. What we know vs. don't
+## 7. Cache TTL sweep
+
+To reduce how long the cached sender private-key handle remains reachable, we swept the absolute
+TTL on the real-Credo admin path (10k messages, 20 connections):
+
+| TTL | Steady msg/s | Cold resolves | p50 / p95 | Total mean |
+|---:|---:|---:|---:|---:|
+| 300 s | 93.83 | 20 | 200 / 310 ms | 88.69 ms |
+| 60 s | **94.72** | 40 | 200 / 290 ms | 86.85 ms |
+| 30 s | 92.77 | 80 | 200 / 280 ms | 88.37 ms |
+| 10 s | 93.67 | 220 | 200 / 280 ms | 88.13 ms |
+
+All runs had zero failures. Throughput stayed within a ~2% band, so **10-second refreshes caused
+no measurable regression** in this test despite 11× more cold resolves than the 300-second run.
+
+Security caveat: the current TTL is checked **lazily on access**. It refreshes an active
+connection after the configured age, but does not actively remove an idle entry. A true
+10-second retention bound requires timer/background eviction; merely changing the setting does
+not provide that guarantee.
+
+---
+
+## 8. What we know vs. don't
 
 **Know (measured on 1.6.0):** the ~58–70 stock ceiling and its cause (per-send Askar/FFI + event
 loop, not storage/mediator/crypto); the fast path's ~1.35–1.5× lift at lower CPU/msg with an
@@ -120,13 +142,14 @@ identical wire format; a single-process ceiling of ~242 msg/s with a cheap recip
   percentages as shares, not exact.
 - **Horizontal scaling linearity** — expected ~N×~240 behind shared Postgres, not yet measured.
 - **Real mediated wallets** differ from local Credo holders; our numbers bound the *issuer*.
-- **Production hardening of the plugin** — cache invalidation is done (event-bus eviction on
-  `connections` events + `FASTPATH_CACHE_TTL`); send-side BasicMessage persistence/webhooks and
-  mediator forward-wrapping remain untested.
+- **Production hardening of the plugin** — event-bus invalidation is done, but TTL expiry is
+  currently lazy; active expiry and best-effort key-handle disposal are still needed for a
+  bounded retention claim. Send-side BasicMessage persistence/webhooks and mediator
+  forward-wrapping also remain untested.
 
 ---
 
-## 8. Recommendations
+## 9. Recommendations
 
 - **Ceiling:** treat **~200–240 msg/s per fast-path process** as the working per-process budget;
   **scale horizontally** behind shared Postgres and validate linearity with 2–4 replicas.
@@ -134,12 +157,14 @@ identical wire format; a single-process ceiling of ~242 msg/s with a cheap recip
   pool pressure.
 - **For a clean absolute number:** rerun §6 with the load generator on a separate host (or
   `cpuset`-pin the issuer).
+- **Key retention:** implement active absolute expiry, then use a **10-second default**; the TTL
+  sweep found no measurable throughput or latency penalty at 10 seconds.
 - **Deeper single-process gains (only if needed):** ECDH shared-secret cache inside pack; tune
   `FASTPATH_PACK_WORKERS`.
 
 ---
 
-## 9. Reproduce
+## 10. Reproduce
 
 From the repository root (see [`REPLICATE_THROUGHPUT.md`](./REPLICATE_THROUGHPUT.md) for detail):
 

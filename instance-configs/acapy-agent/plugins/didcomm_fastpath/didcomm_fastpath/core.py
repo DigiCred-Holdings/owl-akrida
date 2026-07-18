@@ -14,9 +14,9 @@ wire messages remain protocol-valid DIDComm v1 envelopes.
 
 Cache invalidation: any ConnRecord event (update, DID rotation, deletion)
 evicts that connection's cache entry via an event-bus subscription (see
-v1_0.__init__.setup), and entries expire after FASTPATH_CACHE_TTL seconds
-(default 300, 0 disables) as a fallback. DELETE /didcomm-fastpath/cache
-still clears everything manually.
+v1_0.__init__.setup). FASTPATH_CACHE_TTL (default 300, 0 disables) is
+checked lazily on access; it refreshes active entries but does not sweep idle
+ones. DELETE /didcomm-fastpath/cache still clears everything manually.
 """
 
 from __future__ import annotations
