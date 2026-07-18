@@ -257,6 +257,12 @@ Benchmark-only aids: `FASTPATH_DELIVER_OVERRIDE` redirects the delivery HTTP hop
 > (~111 msg/s steady-state with 20 real Credo holders on this host — same order as the 1.3.0
 > numbers; run-to-run host load explains the delta). The reference tables above were **not**
 > re-measured on 1.6.0.
+>
+> **Generalized-path re-verification (final).** After the fast path was generalized to pack+deliver
+> arbitrary AgentMessages (`send_packed`, consumed by `workflow_protocol`), a further 10k fastpath
+> e2e run on 1.6.0 held at **104.9 msg/s, 0 failures** — confirming the refactor did not regress
+> the basicmessage path. Per-stage means: pack 20.1 ms, deliver 56.3 ms (Credo-holder bound),
+> total 76.9 ms. See [`throughput/FASTPATH.md`](./throughput/FASTPATH.md) "Final verification run".
 
 ---
 

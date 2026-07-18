@@ -50,8 +50,9 @@ concurrency — i.e. the remaining ceiling is concurrency/downstream, not ACA-Py
 
 ## Caveats (benchmark-grade, not production-grade)
 
-- Target cache is not invalidated on DID rotation / connection deletion
-  (`DELETE /didcomm-fastpath/cache` clears it manually).
+- ~~Target cache is not invalidated on DID rotation / connection deletion.~~ Now handled:
+  any `connections` record event evicts that entry, plus a `FASTPATH_CACHE_TTL` fallback
+  (default 300 s; `0` disables). `DELETE /didcomm-fastpath/cache` still clears manually.
 - No BasicMessage record persistence or webhook emission on the send side.
 - Mediator forward-wrapping is implemented but has not been benchmarked yet.
 - Sealed-sender blob reuse is protocol-valid (it only conveys the sender verkey) but differs from
@@ -59,6 +60,41 @@ concurrency — i.e. the remaining ceiling is concurrency/downstream, not ACA-Py
 
 Repro: `bash scripts/run-basicmsg-benchmark.sh run fastpath-pg-admin` (and `fastpath-pg-e2e`).
 Artifacts: `results/basicmsg/fastpath-pg-admin/`, `results/basicmsg/fastpath-pg-e2e/`.
+
+---
+
+# Final verification run — ACA-Py 1.6.0 + generalized `send_packed`
+
+After the plugin was (a) rebased on **ACA-Py 1.6.0** (py3.13) and (b) generalized so the pack
+pipeline serves arbitrary AgentMessages (`send_packed` / `send_agent_message`, used by
+`workflow_protocol`) in addition to basic messages, a 10k-message e2e run confirms **no regression
+on the basicmessage path**:
+
+| Run | ACA-Py | Path | Messages | Steady RPS | Failures |
+|---|---|---|---:|---:|---:|
+| fastpath-pg-e2e-final | 1.6.0 | fastpath send + Credo receipt | 10,000 | **104.9** | 0 |
+
+Per-stage means (from `GET /didcomm-fastpath/stats`, 20 cached connections, `pack_workers=32`):
+
+| Stage | Mean | Note |
+|---|---:|---|
+| resolve (cold, once/conn) | 144.3 ms × 20 | one-time per connection |
+| build | 0.22 ms | JSON build, no marshmallow |
+| pack | 20.1 ms | executor pack (fresh CEK/nonce/AEAD) |
+| deliver | 56.3 ms | HTTP POST + Credo holder 200 (holder CPU bound) |
+| total | 76.9 ms | — |
+
+Same shape as the earlier ~89 msg/s runs (deliver dominates because the co-located Credo holders
+do the unpack work); the higher RPS here reflects run-to-run host-load variance, not a code change.
+The takeaway is unchanged: **the issuer is not the bottleneck at this rate**, and the generalized
+path preserves the basicmessage throughput while enabling the workflow fastpath.
+
+Repro: `TARGET_MESSAGE_COUNT=10000 bash scripts/run-basicmsg-benchmark.sh run fastpath-pg-e2e-final`.
+
+> Ops note: on a fresh Postgres volume, first-boot DB initialization can outlast the issuer's
+> store-open retry window (`ProfileError: Failed to open or provision store after retries`). If the
+> scripted run fails on first launch, start the DB once (`... up -d issuer-db`), wait for
+> `pg_isready`, then re-run.
 
 ---
 
