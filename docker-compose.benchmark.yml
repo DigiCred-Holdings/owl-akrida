@@ -13,6 +13,8 @@ services:
       - LOCUST_MIN_WAIT=${LOCUST_MIN_WAIT:-0}
       - LOCUST_MAX_WAIT=${LOCUST_MAX_WAIT:-0}
       - ISSUER_URL=${ISSUER_URL:-http://issuer:8150}
+      # Sticky per-user replica list for horizontal-scaling runs (scale command).
+      - ISSUER_URLS=${ISSUER_URLS:-}
       - ISSUER_HEADERS=${ISSUER_HEADERS:-{}}
       - VERIFIER_URL=${VERIFIER_URL:-http://issuer:8150}
       - VERIFIER_HEADERS=${VERIFIER_HEADERS:-{}}
@@ -70,10 +72,14 @@ services:
       KANON_STORAGE_DATABASE_URL: ${KANON_STORAGE_DATABASE_URL:-}
       KANON_STORAGE_MASTER_KEY: ${KANON_STORAGE_MASTER_KEY:-}
       KANON_STORAGE_AUTO_MIGRATE: ${KANON_STORAGE_AUTO_MIGRATE:-}
+      KANON_STORAGE_POOL_SIZE: ${KANON_STORAGE_POOL_SIZE:-}
+      KANON_STORAGE_POOL_OVERFLOW: ${KANON_STORAGE_POOL_OVERFLOW:-}
       FASTPATH_DELIVER_OVERRIDE: ${FASTPATH_DELIVER_OVERRIDE:-}
       FASTPATH_PACK_WORKERS: ${FASTPATH_PACK_WORKERS:-32}
       FASTPATH_CACHE_TTL: ${FASTPATH_CACHE_TTL:-30}
       FASTPATH_CACHE_MAX: ${FASTPATH_CACHE_MAX:-8192}
+      FASTPATH_INBOUND: ${FASTPATH_INBOUND:-1}
+      FASTPATH_INBOUND_WARM_ON_MISS: ${FASTPATH_INBOUND_WARM_ON_MISS:-1}
     volumes:
       - ./instance-configs/acapy-agent/configs:/home/aries/configs:ro,z
       - issuer-askar-sqlite:/home/aries/.aries_cloudagent
@@ -101,6 +107,12 @@ services:
           ARGS+=(--plugin-config-value "kanon_storage.auto_migrate=true")
           if [ -n "$${KANON_STORAGE_MASTER_KEY:-}" ]; then
             ARGS+=(--plugin-config-value "kanon_storage.master_key=$${KANON_STORAGE_MASTER_KEY}")
+          fi
+          if [ -n "$${KANON_STORAGE_POOL_SIZE:-}" ]; then
+            ARGS+=(--plugin-config-value "kanon_storage.pool_size=$${KANON_STORAGE_POOL_SIZE}")
+          fi
+          if [ -n "$${KANON_STORAGE_POOL_OVERFLOW:-}" ]; then
+            ARGS+=(--plugin-config-value "kanon_storage.pool_overflow=$${KANON_STORAGE_POOL_OVERFLOW}")
           fi
         fi
         exec aca-py "$${ARGS[@]}"

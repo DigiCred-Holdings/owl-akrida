@@ -24,6 +24,8 @@ Commands:
   run <name>         Run one benchmark profile into results/basicmsg/<name>
   matrix             Run the original experiment matrix and write SUMMARY.md
   isolate            Run ACA-Py isolation matrix (no mediator/redis; PG vs SQLite; e2e vs admin)
+  scale <N> [u]      Run fast-path sink across N issuer replicas (shared PG), u users/replica (default 20)
+  scale-sweep [u]    Run scale N=1,2,3 and write results/basicmsg/SCALING.md
 
 Profiles:
   direct-1x20 / direct-20x1 / mediated-* / direct-20x1-pool50 / direct-20x1-debug
@@ -39,6 +41,17 @@ compose() {
     extra+=(--env-file "$RUNTIME_ENV")
   fi
   "${COMPOSE[@]}" "${extra[@]}" "$@"
+}
+
+# Same as compose() but layers in the horizontal-scaling overlay (extra issuer
+# replicas + Postgres max_connections bump).
+SCALE_COMPOSE=(docker compose -p "$PROJECT" -f docker-compose.demo.yml -f docker-compose.benchmark.yml -f docker-compose.scale.yml --env-file sample.benchmark.env)
+scale_compose() {
+  local extra=()
+  if [[ -f "$RUNTIME_ENV" ]]; then
+    extra+=(--env-file "$RUNTIME_ENV")
+  fi
+  "${SCALE_COMPOSE[@]}" "${extra[@]}" "$@"
 }
 
 write_runtime_env() {
@@ -70,10 +83,14 @@ ISSUER_IMAGE_NAME=${ISSUER_IMAGE_NAME:-acapy-cache-redis}
 KANON_STORAGE_DATABASE_URL=${KANON_STORAGE_DATABASE_URL:-}
 KANON_STORAGE_MASTER_KEY=${KANON_STORAGE_MASTER_KEY:-}
 KANON_STORAGE_AUTO_MIGRATE=${KANON_STORAGE_AUTO_MIGRATE:-}
+KANON_STORAGE_POOL_SIZE=${KANON_STORAGE_POOL_SIZE:-}
+KANON_STORAGE_POOL_OVERFLOW=${KANON_STORAGE_POOL_OVERFLOW:-}
 FASTPATH_DELIVER_OVERRIDE=${FASTPATH_DELIVER_OVERRIDE:-}
 FASTPATH_PACK_WORKERS=${FASTPATH_PACK_WORKERS:-32}
 FASTPATH_CACHE_TTL=${FASTPATH_CACHE_TTL:-30}
 FASTPATH_CACHE_MAX=${FASTPATH_CACHE_MAX:-8192}
+FASTPATH_INBOUND=${FASTPATH_INBOUND:-1}
+FASTPATH_INBOUND_WARM_ON_MISS=${FASTPATH_INBOUND_WARM_ON_MISS:-1}
 RUN_NAME=${RUN_NAME:-manual}
 EOF
 }
@@ -153,6 +170,8 @@ profile_env() {
   KANON_STORAGE_DATABASE_URL=""
   KANON_STORAGE_MASTER_KEY=""
   KANON_STORAGE_AUTO_MIGRATE=""
+  KANON_STORAGE_POOL_SIZE=""
+  KANON_STORAGE_POOL_OVERFLOW=""
 
   case "$name" in
     direct-1x20|direct-1x20-r2)
@@ -246,6 +265,44 @@ profile_env() {
       ACAPY_USE_REDIS=0
       ACAPY_WALLET_STORAGE_CONFIG='{"url":"issuer-db:5432","max_connections":30}'
       MEASURE_MODE=fastpath
+      ;;
+    kanon-pg-e2e)
+      # Kanon storage, STOCK send pipeline (no fastpath). Baseline vs
+      # isolate-pg-e2e (stock Askar) to see if Kanon moves the stock ceiling.
+      # Stock does per-message ConnRecord fetch + storage session, so it needs
+      # a much larger pool than the fastpath (60 default exhausts at 20 users).
+      # Kept under Postgres default max_connections=100.
+      LOCUST_USERS=20
+      CONNECTIONS_PER_AGENT=1
+      ACAPY_ARG_FILE=issuer-isolated-kanon.yml
+      ACAPY_USE_REDIS=0
+      ACAPY_WALLET_STORAGE_CONFIG=
+      ACAPY_CLEAR_WALLET_STORAGE_CONFIG=1
+      MEASURE_MODE=e2e
+      ISSUER_DOCKERFILE="./docker/Dockerfile.kanon"
+      ISSUER_IMAGE_NAME="acapy-kanon-benchmark"
+      KANON_STORAGE_DATABASE_URL="postgresql+asyncpg://test:test@issuer-db:5432/test"
+      KANON_STORAGE_MASTER_KEY="0123456789abcdef0123456789abcdef"
+      KANON_STORAGE_AUTO_MIGRATE=true
+      KANON_STORAGE_POOL_SIZE="${KANON_STORAGE_POOL_SIZE:-40}"
+      KANON_STORAGE_POOL_OVERFLOW="${KANON_STORAGE_POOL_OVERFLOW:-40}"
+      ;;
+    kanon-pg-admin)
+      # Kanon storage, STOCK admin-only send (no fastpath, no Credo receipt).
+      LOCUST_USERS=20
+      CONNECTIONS_PER_AGENT=1
+      ACAPY_ARG_FILE=issuer-isolated-kanon.yml
+      ACAPY_USE_REDIS=0
+      ACAPY_WALLET_STORAGE_CONFIG=
+      ACAPY_CLEAR_WALLET_STORAGE_CONFIG=1
+      MEASURE_MODE=admin_only
+      ISSUER_DOCKERFILE="./docker/Dockerfile.kanon"
+      ISSUER_IMAGE_NAME="acapy-kanon-benchmark"
+      KANON_STORAGE_DATABASE_URL="postgresql+asyncpg://test:test@issuer-db:5432/test"
+      KANON_STORAGE_MASTER_KEY="0123456789abcdef0123456789abcdef"
+      KANON_STORAGE_AUTO_MIGRATE=true
+      KANON_STORAGE_POOL_SIZE="${KANON_STORAGE_POOL_SIZE:-40}"
+      KANON_STORAGE_POOL_OVERFLOW="${KANON_STORAGE_POOL_OVERFLOW:-40}"
       ;;
     kanon-fastpath-admin-sink|kanon-fastpath-admin-sink-*)
       # Kanon storage backend; real Credo connections for keys; deliver to
@@ -496,6 +553,203 @@ print("Interpretation: if SQLite ≈ Postgres, storage is not the ceiling. If ad
 PY
 }
 
+# Wait until a scale replica's admin /status/live answers (issuer-2/3 do not
+# publish host ports, so we curl from inside the container).
+wait_replica() {
+  local svc="$1"
+  for _ in $(seq 1 90); do
+    if scale_compose exec -T "$svc" curl -sf "http://localhost:8150/status/live" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# Horizontal issuer-scaling sweep: run the fast-path sink workload across N
+# issuer replicas that share one Postgres wallet, holding per-replica offered
+# load constant. Linear aggregate growth => shared Postgres is not the limiter.
+#   scale <N=1|2|3> [users_per_replica=20]
+cmd_scale() {
+  local n="${1:-2}"
+  local users_per="${2:-20}"
+  case "$n" in 1|2|3) ;; *) echo "scale N must be 1, 2, or 3" >&2; return 1 ;; esac
+
+  local name="scale-fastpath-sink-n${n}"
+  local out="$RESULTS_ROOT/$name"
+  rm -rf "$out"
+  mkdir -p "$out"
+
+  # Base = real-key fast-path send delivered to the mock sink (isolates the
+  # issuer's own ceiling from holder cost). Shared Postgres wallet, per-replica
+  # Askar pool sized so N replicas stay under Postgres max_connections.
+  profile_env fastpath-pg-admin-sink
+  RUN_NAME="$name"
+  LOCUST_USERS=$(( n * users_per ))
+  LOCUST_SPAWN_RATE=5
+  ACAPY_WALLET_STORAGE_CONFIG='{"url":"issuer-db:5432","max_connections":20}'
+  MEDIATION_URL=""
+  export RUN_NAME LOCUST_USERS LOCUST_SPAWN_RATE ACAPY_WALLET_STORAGE_CONFIG MEDIATION_URL
+
+  # Sticky URL list the load agent round-robins over.
+  local urls="http://issuer:8150"
+  if [[ "$n" -ge 2 ]]; then urls="$urls,http://issuer-2:8150"; fi
+  if [[ "$n" -ge 3 ]]; then urls="$urls,http://issuer-3:8150"; fi
+  ISSUER_URLS="$urls"
+  export ISSUER_URLS
+
+  write_runtime_env
+  echo "ISSUER_URLS=$urls" >>"$RUNTIME_ENV"
+
+  # Staggered startup: the base issuer provisions the shared Askar wallet first;
+  # replicas then just open it (avoids a concurrent auto-provision race).
+  scale_compose up -d --build issuer-db mock-holder issuer
+  scale_compose stop load-agent >/dev/null 2>&1 || true
+  echo "Waiting for issuer /status/live ..."
+  if ! wait_issuer; then
+    echo "Base issuer not live" >&2
+    scale_compose logs --tail=160 issuer | tee "$out/issuer-failed.log" >&2
+    return 1
+  fi
+  if [[ "$n" -ge 2 ]]; then
+    scale_compose up -d --build issuer-2
+    echo "Waiting for issuer-2 ..."; wait_replica issuer-2 || { echo "issuer-2 not live" >&2; scale_compose logs --tail=160 issuer-2 | tee "$out/issuer-2-failed.log" >&2; return 1; }
+  fi
+  if [[ "$n" -ge 3 ]]; then
+    scale_compose up -d --build issuer-3
+    echo "Waiting for issuer-3 ..."; wait_replica issuer-3 || { echo "issuer-3 not live" >&2; scale_compose logs --tail=160 issuer-3 | tee "$out/issuer-3-failed.log" >&2; return 1; }
+  fi
+
+  echo "Waiting for mock-holder..."
+  for _ in $(seq 1 30); do
+    if curl -sf "http://localhost:8090/health" >/dev/null 2>&1; then
+      curl -sf -X DELETE "http://localhost:8090/stats" >/dev/null 2>&1 || true
+      break
+    fi
+    sleep 1
+  done
+
+  {
+    echo "run_name=$name"
+    echo "started=$(date -Is)"
+    echo "commit=$(git rev-parse HEAD)"
+    echo "host_cpus=$(nproc)"
+    echo "replicas=$n"
+    echo "users_per_replica=$users_per"
+    echo "users=$LOCUST_USERS"
+    echo "issuer_urls=$urls"
+    echo "target=$TARGET_MESSAGE_COUNT"
+    echo "measure_mode=$MEASURE_MODE"
+    echo "acapy_arg_file=$ACAPY_ARG_FILE"
+    echo "wallet_storage_config=${ACAPY_WALLET_STORAGE_CONFIG}"
+    echo "fastpath_deliver_override=${FASTPATH_DELIVER_OVERRIDE:-}"
+    echo "fastpath_cache_ttl=${FASTPATH_CACHE_TTL:-}"
+    echo "fastpath_cache_max=${FASTPATH_CACHE_MAX:-}"
+  } | tee "$out/run-meta.txt"
+
+  bash "$ROOT/scripts/collect-stats.sh" "$out" 1800 &
+  local collector_pid=$!
+
+  set +e
+  scale_compose run --rm --no-deps --use-aliases \
+    -e LOCUST_USERS \
+    -e CONNECTIONS_PER_AGENT \
+    -e TARGET_MESSAGE_COUNT \
+    -e "WITH_MEDIATION=" \
+    -e "MEDIATION_URL=" \
+    -e "MEASURE_MODE=${MEASURE_MODE}" \
+    -e "ISSUER_URLS=${urls}" \
+    -e MESSAGE_TO_SEND \
+    -e AGENT_IP=load-agent \
+    -e LEDGER=none \
+    -e LOCUST_MIN_WAIT=0 \
+    -e LOCUST_MAX_WAIT=0 \
+    load-agent \
+    pdm run locust -f locust-files/locustBasicMsgBenchmark.py \
+      --headless \
+      -u "$LOCUST_USERS" \
+      -r "$LOCUST_SPAWN_RATE" \
+      -H http://localhost \
+      --csv "/load-agent/results/basicmsg/$name/locust" \
+      --html "/load-agent/results/basicmsg/$name/report.html" \
+      --only-summary 2>&1 | tee "$out/locust.log"
+  local rc=${PIPESTATUS[0]}
+  set -e
+
+  kill "$collector_pid" 2>/dev/null || true
+  wait "$collector_pid" 2>/dev/null || true
+
+  # Per-replica fast-path cache stats (base via host port, others via exec).
+  curl -sf "http://localhost:8150/didcomm-fastpath/stats" | python3 -m json.tool >"$out/fastpath-stats-issuer.json" 2>/dev/null || true
+  if [[ "$n" -ge 2 ]]; then
+    scale_compose exec -T issuer-2 curl -sf "http://localhost:8150/didcomm-fastpath/stats" | python3 -m json.tool >"$out/fastpath-stats-issuer-2.json" 2>/dev/null || true
+  fi
+  if [[ "$n" -ge 3 ]]; then
+    scale_compose exec -T issuer-3 curl -sf "http://localhost:8150/didcomm-fastpath/stats" | python3 -m json.tool >"$out/fastpath-stats-issuer-3.json" 2>/dev/null || true
+  fi
+  curl -sf "http://localhost:8090/stats" | python3 -m json.tool >"$out/mock-holder-stats.json" 2>/dev/null || true
+
+  scale_compose logs --tail=200 issuer >"$out/issuer.log" 2>&1 || true
+
+  local steady
+  steady="$(grep -E '^\[benchmark\] finished' "$out/locust.log" | tail -n1 || true)"
+  if [[ -n "$steady" ]]; then
+    echo "benchmark_line=$steady" | tee -a "$out/run-meta.txt"
+    echo "$steady" | sed -E 's/.*steady_state_seconds=([0-9.]+) steady_state_rps=([0-9.]+)/steady_state_seconds=\1\nsteady_state_rps=\2/' | tee -a "$out/run-meta.txt"
+  fi
+  echo "finished=$(date -Is) exit=$rc" | tee -a "$out/run-meta.txt"
+  return "$rc"
+}
+
+# Run the full N=1,2,3 sweep and print a scaling table.
+cmd_scale_sweep() {
+  local users_per="${1:-20}"
+  local failed=0
+  for n in 1 2 3; do
+    echo "===== Scaling sweep: N=$n replicas ($((n*users_per)) users) ====="
+    if ! cmd_scale "$n" "$users_per"; then
+      echo "Scale N=$n failed (continuing)" >&2
+      failed=1
+    fi
+    scale_compose stop issuer issuer-2 issuer-3 >/dev/null 2>&1 || true
+  done
+  python3 - "$RESULTS_ROOT" "$users_per" <<'PY' | tee "$RESULTS_ROOT/SCALING.md"
+import sys
+from pathlib import Path
+root = Path(sys.argv[1]); users_per = sys.argv[2]
+def meta(name):
+    d = {}
+    f = root / name / "run-meta.txt"
+    if f.exists():
+        for line in f.read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1); d[k.strip()] = v.strip()
+    return d
+print("# Horizontal Issuer Scaling (fast-path sink, shared Postgres)\n")
+print(f"Per-replica offered load held constant at {users_per} Locust users.\n")
+print("| Replicas | Users | Aggregate RPS | Per-replica RPS | Scaling vs 1x |")
+print("|---:|---:|---:|---:|---:|")
+base = None
+for n in (1, 2, 3):
+    d = meta(f"scale-fastpath-sink-n{n}")
+    if not d:
+        continue
+    rps = d.get("steady_state_rps")
+    try:
+        rps_f = float(rps)
+    except (TypeError, ValueError):
+        print(f"| {n} | {d.get('users','?')} | n/a | n/a | n/a |"); continue
+    if base is None:
+        base = rps_f
+    per = rps_f / n
+    print(f"| {n} | {d.get('users','?')} | {rps_f:.1f} | {per:.1f} | {rps_f/base:.2f}x |")
+print("\nInterpretation: if per-replica RPS stays flat and aggregate scales ~N x, "
+      "the shared Postgres tier is not the bottleneck on this host. A falling "
+      "per-replica RPS indicates contention (shared DB or host CPU saturation).")
+PY
+  return "$failed"
+}
+
 main() {
   local cmd="${1:-}"
   shift || true
@@ -508,6 +762,8 @@ main() {
     run) cmd_run "$@" ;;
     matrix) cmd_matrix "$@" ;;
     isolate) cmd_isolate "$@" ;;
+    scale) cmd_scale "$@" ;;
+    scale-sweep) cmd_scale_sweep "$@" ;;
     -h|--help|help|"") usage ;;
     *) echo "Unknown command: $cmd" >&2; usage; return 1 ;;
   esac

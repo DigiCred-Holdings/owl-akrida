@@ -41,8 +41,10 @@ from aries_askar import Key, KeyAlg, crypto_box
 from aries_askar.bindings import key_get_secret_bytes
 
 from acapy_agent.connections.base_manager import BaseConnectionManager
+from acapy_agent.connections.models.conn_record import ConnRecord
 from acapy_agent.core.profile import Profile
 from acapy_agent.utils.jwe import JweEnvelope, JweRecipient, b64url
+from acapy_agent.wallet.base import BaseWallet
 from acapy_agent.wallet.util import b58_to_bytes
 
 LOGGER = logging.getLogger(__name__)
@@ -67,8 +69,15 @@ class RecipientCrypto:
 
 
 @dataclass
-class CachedTarget:
-    """Everything needed to pack and deliver to one connection."""
+class CachedConnectionCrypto:
+    """Bidirectional crypto and delivery material for one connection.
+
+    The local ``sender_xk`` keypair used to authcrypt outbound messages is the
+    same private X25519 key needed to decrypt inbound messages addressed to
+    ``sender_vk_b``. Likewise, ``recipients[].xk`` are the remote public keys
+    used in both directions. One object therefore owns both directions' native
+    key handles; the inbound recipient-key index only references this object.
+    """
 
     endpoint: str
     recipients: List[RecipientCrypto]
@@ -79,6 +88,12 @@ class CachedTarget:
     wallet_id: str = "base"
     connection_id: str = ""
     cached_at: float = 0.0  # time.monotonic() at cache insert, for TTL expiry
+    connection_record: Optional[ConnRecord] = None
+    recipient_did_public: bool = False
+
+
+# Backwards-compatible name used by the original outbound implementation.
+CachedTarget = CachedConnectionCrypto
 
 
 @dataclass
@@ -117,6 +132,8 @@ class CacheMetrics:
     expirations_ttl: int = 0
     invalidations_connection: int = 0
     invalidations_wallet: int = 0
+    inbound_cache_hits: int = 0
+    inbound_cache_misses: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -124,6 +141,8 @@ class CacheMetrics:
             "expirations_ttl": self.expirations_ttl,
             "invalidations_connection": self.invalidations_connection,
             "invalidations_wallet": self.invalidations_wallet,
+            "inbound_cache_hits": self.inbound_cache_hits,
+            "inbound_cache_misses": self.inbound_cache_misses,
         }
 
 
@@ -164,6 +183,8 @@ def dispose_target(target: Optional[CachedTarget]) -> None:
         target.routing_recipients.clear()
         target.sender_xk = None  # type: ignore[assignment]
         target.sender_vk_b = b""
+        target.connection_record = None
+        target.recipient_did_public = False
     except Exception:  # pragma: no cover - defensive
         LOGGER.debug("dispose_target failed", exc_info=True)
 
@@ -174,12 +195,18 @@ class FastpathState:
     STAGES = ("resolve_cold", "build", "pack", "deliver", "total")
 
     def __init__(self):
-        self.targets: "OrderedDict[str, CachedTarget]" = OrderedDict()
+        self.targets: "OrderedDict[str, CachedConnectionCrypto]" = OrderedDict()
+        # Secondary references only: (wallet, local recipient verkey) -> one or
+        # more primary connection-cache keys. No key handles are duplicated.
+        self.recipient_index: Dict[str, "OrderedDict[str, None]"] = {}
         self._http: Optional[ClientSession] = None
         self.stats: Dict[str, StageStats] = {s: StageStats() for s in self.STAGES}
         self.cache_metrics = CacheMetrics()
         self.first_send_ts: Optional[float] = None
         self.last_send_ts: Optional[float] = None
+        self.inbound_handled_count = 0
+        self.first_inbound_handled_ts: Optional[float] = None
+        self.last_inbound_handled_ts: Optional[float] = None
         # Optional external timing dict (e.g. workflow_protocol stages)
         self.external_stats: Dict[str, Any] = {}
         self._sweep_task: Optional[asyncio.Task] = None
@@ -196,9 +223,23 @@ class FastpathState:
             window = self.last_send_ts - self.first_send_ts
             out["observed_rps"] = round(sends / window, 2)
             out["window_seconds"] = round(window, 3)
+        out["inbound_handled"] = self.inbound_handled_count
+        if (
+            self.inbound_handled_count
+            and self.first_inbound_handled_ts
+            and self.last_inbound_handled_ts != self.first_inbound_handled_ts
+        ):
+            inbound_window = (
+                self.last_inbound_handled_ts - self.first_inbound_handled_ts
+            )
+            out["inbound_observed_rps"] = round(
+                self.inbound_handled_count / inbound_window, 2
+            )
+            out["inbound_window_seconds"] = round(inbound_window, 3)
         n = len(self.targets)
         out["cache_entries"] = n
         out["cached_connections"] = n  # alias kept for older dashboards
+        out["inbound_index_keys"] = len(self.recipient_index)
         out["cache_max"] = cache_max_entries()
         out["ttl_seconds"] = cache_ttl_seconds()
         out["pack_workers"] = _PACK_POOL._max_workers  # type: ignore[attr-defined]
@@ -212,10 +253,27 @@ class FastpathState:
         self.stats = {s: StageStats() for s in self.STAGES}
         self.first_send_ts = None
         self.last_send_ts = None
+        self.inbound_handled_count = 0
+        self.first_inbound_handled_ts = None
+        self.last_inbound_handled_ts = None
 
-    def get(self, wallet_id: str, connection_id: str) -> Optional[CachedTarget]:
+    def record_inbound_handled(self) -> None:
+        """Count a BasicMessage after its stock ACA-Py handler completed."""
+        now = time.monotonic()
+        if self.first_inbound_handled_ts is None:
+            self.first_inbound_handled_ts = now
+        self.last_inbound_handled_ts = now
+        self.inbound_handled_count += 1
+
+    def get(
+        self, wallet_id: str, connection_id: str
+    ) -> Optional[CachedConnectionCrypto]:
         """Return a fresh cached target, touching LRU order on hit."""
         key = cache_key(wallet_id, connection_id)
+        return self._get_by_key(key)
+
+    def _get_by_key(self, key: str) -> Optional[CachedConnectionCrypto]:
+        """Return one primary cache entry by key, enforcing TTL and LRU."""
         cached = self.targets.get(key)
         if not cached:
             return None
@@ -226,19 +284,49 @@ class FastpathState:
         self.targets.move_to_end(key)
         return cached
 
-    def put(self, wallet_id: str, connection_id: str, target: CachedTarget) -> None:
+    def get_by_recipient(
+        self, wallet_id: str, recipient_verkey: str
+    ) -> List[CachedConnectionCrypto]:
+        """Return live connection objects addressed to one local recipient key.
+
+        Pairwise connections normally produce one candidate. A list correctly
+        handles deployments that reuse a local DID/key across connections; the
+        authenticated sender key selects the matching candidate during unpack.
+        """
+        index_key = cache_key(wallet_id, recipient_verkey)
+        primary_keys = list(self.recipient_index.get(index_key, ()))
+        candidates = []
+        for primary_key in primary_keys:
+            cached = self._get_by_key(primary_key)
+            if cached is not None:
+                candidates.append(cached)
+        if candidates:
+            self.cache_metrics.inbound_cache_hits += 1
+        else:
+            self.cache_metrics.inbound_cache_misses += 1
+        return candidates
+
+    def put(
+        self,
+        wallet_id: str,
+        connection_id: str,
+        target: CachedConnectionCrypto,
+    ) -> None:
         """Insert/replace a target; evict LRU entries if over max size."""
         key = cache_key(wallet_id, connection_id)
         target.wallet_id = wallet_id
         target.connection_id = connection_id
         if key in self.targets:
             old = self.targets.pop(key)
+            self._unindex_target(key, old)
             dispose_target(old)
         self.targets[key] = target
+        self._index_target(key, target)
         self.targets.move_to_end(key)
         max_entries = cache_max_entries()
         while max_entries > 0 and len(self.targets) > max_entries:
             old_key, old = self.targets.popitem(last=False)
+            self._unindex_target(old_key, old)
             dispose_target(old)
             self.cache_metrics.evictions_lru += 1
             LOGGER.debug("didcomm_fastpath: LRU evicted %s", old_key)
@@ -274,8 +362,10 @@ class FastpathState:
             return self.invalidate_wallet(wallet_id)
         n = len(self.targets)
         while self.targets:
-            _, old = self.targets.popitem(last=True)
+            key, old = self.targets.popitem(last=True)
+            self._unindex_target(key, old)
             dispose_target(old)
+        self.recipient_index.clear()
         return n
 
     def expire_stale(self) -> int:
@@ -295,10 +385,11 @@ class FastpathState:
 
     def _pop_and_dispose(
         self, key: str, reason: str
-    ) -> Optional[CachedTarget]:
+    ) -> Optional[CachedConnectionCrypto]:
         target = self.targets.pop(key, None)
         if target is None:
             return None
+        self._unindex_target(key, target)
         dispose_target(target)
         if reason == "ttl":
             self.cache_metrics.expirations_ttl += 1
@@ -307,6 +398,38 @@ class FastpathState:
         elif reason == "wallet":
             self.cache_metrics.invalidations_wallet += 1
         return target
+
+    def _index_target(
+        self, primary_key: str, target: CachedConnectionCrypto
+    ) -> None:
+        """Index a connection object by its local inbound recipient verkey."""
+        if not target.sender_vk_b:
+            return
+        try:
+            recipient_verkey = target.sender_vk_b.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        index_key = cache_key(target.wallet_id, recipient_verkey)
+        bucket = self.recipient_index.setdefault(index_key, OrderedDict())
+        bucket[primary_key] = None
+
+    def _unindex_target(
+        self, primary_key: str, target: CachedConnectionCrypto
+    ) -> None:
+        """Remove secondary references before disposing the owning object."""
+        if not target.sender_vk_b:
+            return
+        try:
+            recipient_verkey = target.sender_vk_b.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        index_key = cache_key(target.wallet_id, recipient_verkey)
+        bucket = self.recipient_index.get(index_key)
+        if not bucket:
+            return
+        bucket.pop(primary_key, None)
+        if not bucket:
+            self.recipient_index.pop(index_key, None)
 
     def start_sweeper(self) -> None:
         """Start background TTL sweep if not already running."""
@@ -418,6 +541,19 @@ async def resolve_target(profile: Profile, connection_id: str) -> CachedTarget:
     # Fetch the sender signing key once; keep independent handles so nothing
     # references a closed session or freed entry list.
     async with profile.session() as session:
+        connection_record = await ConnRecord.retrieve_by_id(session, connection_id)
+        recipient_did_public = False
+        if connection_record.my_did:
+            try:
+                wallet = session.inject(BaseWallet)
+                my_info = await wallet.get_local_did(connection_record.my_did)
+                recipient_did_public = bool(
+                    my_info.metadata.get("posted", False)
+                )
+            except Exception:
+                # Public-DID metadata only affects receipt decoration. Unknown
+                # metadata safely retains stock's default false value.
+                pass
         entry = await session.handle.fetch_key(target.sender_key)
         if not entry:
             raise LookupError(f"Missing sender key {target.sender_key}")
@@ -438,6 +574,8 @@ async def resolve_target(profile: Profile, connection_id: str) -> CachedTarget:
         wallet_id=wallet_id,
         connection_id=connection_id,
         cached_at=time.monotonic(),
+        connection_record=connection_record,
+        recipient_did_public=recipient_did_public,
     )
     STATE.put(wallet_id, connection_id, cached)
     STATE.record("resolve_cold", time.perf_counter_ns() - start)

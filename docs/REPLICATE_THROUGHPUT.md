@@ -84,6 +84,39 @@ Sink counters:
 curl -s localhost:8090/stats | python3 -m json.tool
 ```
 
+### Horizontal scaling (shared Postgres, mock-sink)
+
+N issuer replicas share one Askar Postgres wallet; Locust pins each user to one
+replica (sticky). On a 12-core host expect aggregate ~185 → ~250 → plateau
+(host CPU, not Postgres). Writes `results/basicmsg/SCALING.md`.
+
+```bash
+bash scripts/run-basicmsg-benchmark.sh scale-sweep 20   # N=1,2,3
+# or a single N:
+bash scripts/run-basicmsg-benchmark.sh scale 2 20       # 2 replicas × 20 users
+```
+
+### Inbound replay (~175 stock → ~210 fast-path handled msg/s)
+
+Replays a wire-valid authcrypt BasicMessage straight at the issuer's DIDComm
+inbound endpoint from a helper container; completion is counted at the stock
+BasicMessage handler's `received` event, not HTTP acceptance.
+
+```bash
+# fast-path inbound (default: FASTPATH_INBOUND=1)
+docker run --rm --entrypoint python --network owl-benchmark_app-network \
+  -v "$PWD/scripts:/bench:ro" acapy-cache-redis \
+  /bench/run-inbound-benchmark.py --messages 10000 --concurrency 20
+
+# stock baseline: recreate the issuer with FASTPATH_INBOUND=0, then rerun
+FASTPATH_INBOUND=0 docker compose -p owl-benchmark \
+  -f docker-compose.demo.yml -f docker-compose.benchmark.yml \
+  --env-file sample.benchmark.env up -d --force-recreate issuer
+```
+
+The JSON result includes `handled_rps`, `cache_hits`/`cache_misses`, and hot vs
+cold unpack timings (hot ≈ 0.8 ms, cold/stock ≈ 53 ms).
+
 ### Tear down
 
 ```bash
@@ -101,6 +134,7 @@ bash scripts/run-basicmsg-benchmark.sh reset   # remove volumes
 |---|---|
 | Compose base | `docker-compose.demo.yml` |
 | Benchmark overlay | `docker-compose.benchmark.yml` |
+| Scale overlay | `docker-compose.scale.yml` (issuer-2/3 + Postgres `max_connections=300`) |
 | Env defaults | `sample.benchmark.env` |
 | Issuer image | `instance-configs/acapy-agent/docker/Dockerfile` (ACA-Py 1.6.0 on py3.13 + redis cache + `py-spy` + `didcomm_fastpath`) |
 | Fast-path plugin | `instance-configs/acapy-agent/plugins/didcomm_fastpath/` |
@@ -145,6 +179,7 @@ bash scripts/run-basicmsg-benchmark.sh help
 | Fast-path → Credo (`fastpath-pg-admin` / `-e2e`) | ~94 / ~105 |
 | Fast-path → mock sink @ 20 holders | ~220 |
 | Fast-path → mock sink @ 60 holders | ~240 |
+| Inbound replay, stock / fast-path | ~175 / ~210 |
 
 Exact numbers vary by host. Compare **ratios and relative gains**, and check
 `fastpath-stats.json` / `mock-holder-stats.json` under each run directory.

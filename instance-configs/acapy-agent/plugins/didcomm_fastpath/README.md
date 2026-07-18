@@ -19,6 +19,8 @@ Env:
 - `FASTPATH_PACK_WORKERS` — pack thread pool size (default 32)
 - `FASTPATH_CACHE_TTL` — absolute entry age in seconds (default **30**; `0` disables); lazy + ~1s active sweep
 - `FASTPATH_CACHE_MAX` — max cached targets, LRU (default 8192; `0` unbounded); size by peak concurrent active connections, not total
+- `FASTPATH_INBOUND` — shared-cache inbound unpack + dispatcher `ConnRecord` reuse (default **1**; `0` = stock inbound)
+- `FASTPATH_INBOUND_WARM_ON_MISS` — cold stock unpack warms the shared cache (default **1**)
 
 Cache key = `(local_tenant_wallet_id, connection_id)` — `wallet_id` is *our* ACA-Py
 tenant subwallet, not the remote peer. Hardening: ConnRecord eviction, active TTL,

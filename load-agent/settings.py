@@ -45,6 +45,15 @@ class Settings(object):
 
     # Issuer
     ISSUER_URL: str = os.getenv("ISSUER_URL")
+    # Optional comma-separated list of issuer base URLs for horizontal-scaling
+    # runs. Each Locust user is pinned (sticky) to one entry, round-robin, so a
+    # connection is always established and sent on the same replica. Falls back
+    # to the single ISSUER_URL when unset.
+    ISSUER_URLS: list = [
+        u.strip()
+        for u in os.getenv("ISSUER_URLS", os.getenv("ISSUER_URL") or "").split(",")
+        if u.strip()
+    ]
     ISSUER_TYPE: str = os.getenv("ISSUER_TYPE", "acapy")
     # ISSUER_API_KEY: str = os.getenv("ISSUER_API_KEY", None)
     # ISSUER_API_TOKEN: str = os.getenv("ISSUER_API_TOKEN", None)

@@ -35,6 +35,32 @@ class PortManager:
 portmanager = PortManager()
 
 
+class IssuerUrlRotator:
+    """Assign each Locust user a sticky issuer replica URL (round-robin).
+
+    Horizontal-scaling runs point the load agent at several issuer replicas via
+    ISSUER_URLS. A user must always establish and send on the same replica, so
+    each CustomClient grabs one URL at construction time.
+    """
+
+    def __init__(self):
+        self.lock = gevent_lock.BoundedSemaphore()
+        self.urls = list(Settings.ISSUER_URLS) or [Settings.ISSUER_URL]
+        self.idx = 0
+
+    def next(self):
+        self.lock.acquire()
+        try:
+            url = self.urls[self.idx % len(self.urls)]
+            self.idx += 1
+            return url
+        finally:
+            self.lock.release()
+
+
+issuer_url_rotator = IssuerUrlRotator()
+
+
 def stopwatch(func):
     def wrapper(*args, **kwargs):
         # get task's function name
@@ -87,6 +113,12 @@ class CustomClient:
         # Load modules here depending on config
         self._load_issuer()
         self._load_verifier()
+
+        # Pin this user to one issuer replica (sticky) for scaling runs. Harmless
+        # single-replica default just re-uses the configured ISSUER_URL.
+        self.agent_url = issuer_url_rotator.next()
+        if getattr(self, "issuer", None) is not None:
+            self.issuer.agent_url = self.agent_url
 
     def _load_issuer(self):
         """Load issuer agent based on configuration"""

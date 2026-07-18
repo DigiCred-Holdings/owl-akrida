@@ -1,0 +1,77 @@
+# Horizontal issuer-scaling overlay for the basic-message benchmark.
+#
+# Adds up to two extra ACA-Py issuer replicas (issuer-2, issuer-3) that share
+# the SAME Postgres Askar wallet as the base `issuer` service. Each replica has
+# its own DIDComm inbound endpoint so connection setup routes back correctly,
+# and its own per-process fast-path cache. The only shared tier is Postgres, so
+# a scaling sweep (N=1,2,3) shows whether aggregate throughput grows linearly or
+# the shared DB becomes the bottleneck.
+#
+# Usage (via scripts/run-basicmsg-benchmark.sh scale <N> [users_per_replica]):
+#   docker compose -p owl-benchmark \
+#     -f docker-compose.demo.yml -f docker-compose.benchmark.yml \
+#     -f docker-compose.scale.yml --env-file sample.benchmark.env up -d
+#
+# Replicas only run the fast-path Postgres profile (issuer-isolated-pg-fastpath.yml).
+
+x-issuer-replica: &issuer-replica
+  build:
+    context: ./instance-configs/acapy-agent
+    dockerfile: ${ISSUER_DOCKERFILE:-./docker/Dockerfile}
+  image: ${ISSUER_IMAGE_NAME:-acapy-cache-redis}
+  cap_add:
+    - SYS_PTRACE
+  security_opt:
+    - seccomp:unconfined
+  environment: &issuer-replica-env
+    ACAPY_ADMIN_API_KEY: ""
+    ACAPY_ADMIN_INSECURE_MODE: "true"
+    ACAPY_ARG_FILE: ${ACAPY_ARG_FILE:-issuer-isolated-pg-fastpath.yml}
+    ACAPY_LOG_LEVEL: ${ACAPY_LOG_LEVEL:-info}
+    ACAPY_WALLET_STORAGE_CONFIG: ${ACAPY_WALLET_STORAGE_CONFIG:-}
+    ACAPY_WALLET_STORAGE_CREDS: ${ACAPY_WALLET_STORAGE_CREDS}
+    FASTPATH_DELIVER_OVERRIDE: ${FASTPATH_DELIVER_OVERRIDE:-}
+    FASTPATH_PACK_WORKERS: ${FASTPATH_PACK_WORKERS:-32}
+    FASTPATH_CACHE_TTL: ${FASTPATH_CACHE_TTL:-30}
+    FASTPATH_CACHE_MAX: ${FASTPATH_CACHE_MAX:-8192}
+  volumes:
+    - ./instance-configs/acapy-agent/configs:/home/aries/configs:ro,z
+    - ./results:/results
+    - ./instance-configs/acapy-agent/plugins/didcomm_fastpath/didcomm_fastpath:/home/aries/.local/lib/python3.13/site-packages/didcomm_fastpath:ro
+  healthcheck:
+    test: curl -s -o /dev/null -w '%{http_code}' "http://localhost:8150/status/live" | grep "200" > /dev/null
+    start_period: 30s
+    interval: 7s
+    timeout: 5s
+    retries: 8
+  depends_on:
+    - issuer-db
+  networks:
+    - app-network
+  entrypoint: ["/bin/bash", "-c"]
+
+services:
+  # Bump Postgres connection ceiling so the shared DB is not an artificial cap
+  # when several replicas each open their own Askar pool.
+  issuer-db:
+    command: ["postgres", "-c", "max_connections=300"]
+
+  issuer-2:
+    <<: *issuer-replica
+    hostname: issuer-2
+    command:
+      - |
+        exec aca-py start \
+          --arg-file "./configs/${ACAPY_ARG_FILE:-issuer-isolated-pg-fastpath.yml}" \
+          --endpoint http://issuer-2:8151 \
+          --log-level "${ACAPY_LOG_LEVEL:-info}"
+
+  issuer-3:
+    <<: *issuer-replica
+    hostname: issuer-3
+    command:
+      - |
+        exec aca-py start \
+          --arg-file "./configs/${ACAPY_ARG_FILE:-issuer-isolated-pg-fastpath.yml}" \
+          --endpoint http://issuer-3:8151 \
+          --log-level "${ACAPY_LOG_LEVEL:-info}"

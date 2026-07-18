@@ -1,7 +1,7 @@
-"""didcomm_fastpath — experimental fast-path DIDComm v1 send pipeline for ACA-Py.
+"""didcomm_fastpath — bidirectional fast-path DIDComm v1 pipeline for ACA-Py.
 
 Registers admin routes under /didcomm-fastpath (see routes.py) and evicts
-cached connection targets whenever the underlying ConnRecord changes.
+cached connection objects whenever the underlying ConnRecord changes.
 """
 
 import logging
@@ -14,6 +14,7 @@ from acapy_agent.core.profile import Profile
 LOGGER = logging.getLogger(__name__)
 
 CONN_RECORD_EVENT_PATTERN = re.compile("^acapy::record::connections::.*$")
+BASICMESSAGE_RECEIVED_PATTERN = re.compile("^acapy::basicmessage::received$")
 
 
 async def on_connection_event(profile: Profile, event: Event):
@@ -53,9 +54,19 @@ async def on_wallet_removed(profile: Profile, event: Event):
         )
 
 
+async def on_basicmessage_received(profile: Profile, event: Event):
+    """Count messages only after the stock BasicMessage handler notifies."""
+    from .core import STATE
+
+    STATE.record_inbound_handled()
+
+
 async def setup(context: InjectionContext):
-    """Plugin entry point: subscribe cache eviction to connection events."""
+    """Install inbound unpack and subscribe cache lifecycle events."""
     from .core import STATE, WALLET_REMOVED_TOPIC
+    from .inbound import install_inbound_wire_format
+
+    install_inbound_wire_format(context)
 
     event_bus = context.inject_or(EventBus)
     if event_bus:
@@ -63,6 +74,7 @@ async def setup(context: InjectionContext):
         event_bus.subscribe(
             re.compile(f"^{re.escape(WALLET_REMOVED_TOPIC)}$"), on_wallet_removed
         )
+        event_bus.subscribe(BASICMESSAGE_RECEIVED_PATTERN, on_basicmessage_received)
     else:
         LOGGER.warning(
             "didcomm_fastpath: no EventBus available; "

@@ -165,19 +165,51 @@ profiles (Dockerfile `docker/Dockerfile.kanon`).
 
 ---
 
-## 8. What we know vs. don't
+## 8. Horizontal scaling (shared Postgres, mock-sink)
+
+To check whether the per-process ceiling is additive, we ran the fast-path mock-sink workload
+across **N = 1, 2, 3 issuer replicas** that share one Askar Postgres wallet. Each Locust user is
+pinned (sticky) to one replica so connection setup and sends stay on the same process; each
+replica has its own DIDComm inbound endpoint and its own per-process fast-path cache. Offered
+load is held constant at **20 Locust users per replica**.
+
+| Replicas | Users | Aggregate msg/s | Per-replica msg/s | vs 1× |
+|---:|---:|---:|---:|---:|
+| 1 | 20 | **185.3** | 185.3 | 1.00× |
+| 2 | 40 | **250.7** | 125.4 | 1.35× |
+| 3 | 60 | 243.4 | 81.1 | 1.31× |
+
+- **Shared-wallet + sticky routing works.** Sends split evenly across replicas (N=2 ≈
+  5019 / 4981; N=3 ≈ 3349 / 3321 / 3330) and every message landed at the mock sink (0 failures).
+- **Aggregate peaks ~250 msg/s on this host, then plateaus.** Locust itself warned
+  `CPU usage above 90%` during N=2 and N=3 — the load generator (and its Credo agents used for
+  connection setup) saturated the 12-core box. Mean per-send latency on each issuer actually
+  *dropped* at N=3 (≈19 ms vs ≈28 ms at N=1), so the issuers were under-loaded; the host was
+  the limiter, not Postgres.
+- **What this proves on one box:** multi-replica shared-wallet send is correct and adds
+  capacity until the host is full. It does **not** prove linear N× scaling — that needs the
+  load generator (and ideally the replicas) on separate hosts. Reproduce with
+  `bash scripts/run-basicmsg-benchmark.sh scale-sweep 20` (writes `results/basicmsg/SCALING.md`).
+
+---
+
+## 9. What we know vs. don't
 
 **Know (measured on 1.6.0):** the ~58–70 stock ceiling and its cause (per-send Askar/FFI + event
 loop, not storage/mediator/crypto); the fast path's ~1.35–1.5× lift at lower CPU/msg with an
 identical wire format; a single-process ceiling of ~242 msg/s with a cheap recipient; the fast
-path holds within ~5–10% on the Kanon (SQLAlchemy) storage backend (§7).
+path holds within ~5–10% on the Kanon (SQLAlchemy) storage backend (§7); multi-replica shared-
+wallet send works and lifts aggregate throughput until the host saturates (§8); the shared
+bidirectional cache lifts the full inbound pipeline ~1.2× (174.7 → 210.5 handled msg/s) with hot
+unpack at 0.8 ms vs 53 ms cold (Appendix A).
 
 **Don't (open):**
 - **Absolute ceiling on dedicated hardware** — even sink runs co-locate the load generator; a
   remote generator or CPU-pinned issuer would give a cleaner number.
 - **py-spy split is directional** — ~40% of samples dropped to native unwinding; treat the
   percentages as shares, not exact.
-- **Horizontal scaling linearity** — expected ~N×~240 behind shared Postgres, not yet measured.
+- **True multi-host horizontal linearity** — §8 is single-host and host-CPU-limited past N=2;
+  N×~240 behind shared Postgres across machines is still unmeasured.
 - **Real mediated wallets** differ from local Credo holders; our numbers bound the *issuer*.
 - **Remaining plugin gaps** — send-side BasicMessage persistence/webhooks and mediator
   forward-wrapping remain untested. Cache isolation, active TTL, LRU, wallet-removal hook,
@@ -185,23 +217,27 @@ path holds within ~5–10% on the Kanon (SQLAlchemy) storage backend (§7).
 
 ---
 
-## 9. Recommendations
+## 10. Recommendations
 
 - **Ceiling:** treat **~200–240 msg/s per fast-path process** as the working per-process budget;
-  **scale horizontally** behind shared Postgres and validate linearity with 2–4 replicas.
+  **scale horizontally** behind shared Postgres. On one host expect the aggregate to plateau
+  once the load generator / Credo agents fill the cores (§8); true N× needs separate hosts.
 - **Storage tuning is a dead end** past an adequate Askar pool; keep Redis only for setup-time
   pool pressure.
-- **For a clean absolute number:** rerun §6 with the load generator on a separate host (or
-  `cpuset`-pin the issuer).
+- **For a clean absolute / scaling number:** rerun §6 and §8 with the load generator on a
+  separate host (or `cpuset`-pin the issuer replicas).
 - **Key retention:** default **30-second active TTL** + LRU + tenant-scoped keys; the TTL
   sweep found no measurable throughput or latency penalty even at 10 seconds, so tighten
   the TTL freely if a shorter secret-retention window is required.
+- **Inbound:** leave `FASTPATH_INBOUND=1` for busy receive paths (~1.2× on the full
+  pipeline, Appendix A), but treat the `find_inbound_connection` override as version-sensitive —
+  re-verify it (or set `FASTPATH_INBOUND=0`) when upgrading ACA-Py.
 - **Deeper single-process gains (only if needed):** ECDH shared-secret cache inside pack; tune
   `FASTPATH_PACK_WORKERS`.
 
 ---
 
-## 10. Reproduce
+## 11. Reproduce
 
 From the repository root (see [`REPLICATE_THROUGHPUT.md`](./REPLICATE_THROUGHPUT.md) for detail):
 
@@ -224,6 +260,16 @@ done
 bash scripts/run-basicmsg-benchmark.sh run kanon-fastpath-admin-sink
 bash scripts/run-basicmsg-benchmark.sh run kanon-fastpath-e2e
 
+# horizontal scaling (§8) — N=1,2,3 replicas, shared PG, mock-sink
+# on a 12-core host expect ~185 → ~250 → plateau (host CPU, not Postgres)
+bash scripts/run-basicmsg-benchmark.sh scale-sweep 20
+
+# inbound replay (Appendix A) — expect ~175 stock / ~210 fast-path handled msg/s
+# (start the issuer with FASTPATH_INBOUND=0 for the stock baseline)
+docker run --rm --entrypoint python --network owl-benchmark_app-network \
+  -v "$PWD/scripts:/bench:ro" acapy-cache-redis \
+  /bench/run-inbound-benchmark.py --messages 10000 --concurrency 20
+
 # live per-stage timings
 curl -s localhost:8150/didcomm-fastpath/stats | python3 -m json.tool
 ```
@@ -236,3 +282,94 @@ The issuer image is ACA-Py `py3.13-1.6.0` + `didcomm_fastpath` (built from
 `instance-configs/acapy-agent/`); the `didcomm_fastpath` plugin also ships in `digicred-crms`.
 Raw per-run artifacts (Locust CSV/HTML, docker stats, logs) land in `results/basicmsg/<profile>/`
 (gitignored).
+
+---
+
+## Appendix A — Inbound fast path (shared bidirectional cache)
+
+Everything in §3–§8 measures the **send** side. Receiving has the same
+per-message shape in reverse — Askar session, key lookup, unpack FFI, then a
+wallet round-trip in the dispatcher to re-find the `ConnRecord`. The plugin
+extends the *same* cached connection object to cover it: the X25519 keypair
+cached for outbound authcrypt is the private key that decrypts inbound messages
+addressed to that verkey, so inbound and outbound share one
+`CachedConnectionCrypto` (one set of native key handles, one TTL/LRU/invalidation
+lifecycle), with a secondary index by `(wallet_id, local recipient verkey)`.
+
+### A.1 Results
+
+Wire-valid authcrypt BasicMessage replayed straight at the DIDComm inbound
+endpoint; 10 000 messages, 20 concurrent posters, one connection. Completion is
+counted at the stock BasicMessage handler's `received` event, **not** HTTP
+acceptance.
+
+| Inbound path | Handled msg/s | Failures | Cache hits / misses | Hot unpack mean | Cold unpack mean |
+|---|---:|---:|---|---:|---:|
+| Stock (`FASTPATH_INBOUND=0`) | 174.7 | 0 | — | — | — |
+| Fast path (`FASTPATH_INBOUND=1`) | **210.5** | 0 | 9 901 / 99 | **0.80 ms** | 53.2 ms |
+
+- **~1.2× on the full inbound pipeline.** Hot cached unpack is ~66× faster than
+  the cold/stock unpack (0.80 ms vs 53.2 ms); the remaining ~4 ms/msg is the
+  stock dispatcher, handler, and event plumbing the fast path leaves untouched.
+- The 99 misses are the initial warm plus one TTL-expiry batch mid-run (the 30 s
+  `FASTPATH_CACHE_TTL` elapsed inside the 47 s run); each fell back cleanly to
+  stock unpack and re-warmed the shared object.
+- Issuer CPU ~108% mean / ~122% peak — the same single-core process bound as the
+  send side.
+
+### A.2 Design & security
+
+- **Two integration points, both installed by the plugin at load** (nothing in
+  the ACA-Py package is edited on disk):
+  1. a `BaseWireFormat` injector binding (supported extension point) that tries a
+     cached inline decrypt first and falls back to the fully stock unpack on any
+     miss, which then warms the shared object;
+  2. a runtime override of `BaseConnectionManager.find_inbound_connection` so the
+     dispatcher reuses the already-authenticated cached `ConnRecord` instead of a
+     per-message wallet round-trip. This is a **monkeypatch** — version-sensitive;
+     it delegates to the stock method whenever no cached record is attached, and
+     `FASTPATH_INBOUND=0` disables all of it.
+- **Security posture unchanged:** hits require the exact `(wallet_id, recipient
+  verkey)` index entry; authcrypt sender verification still runs (decrypted
+  sender verkey must match the cached connection's); the `ConnRecord` shortcut is
+  only taken for authcrypt (anoncrypt has no authenticated sender); the same
+  TTL/LRU/invalidation applies since it is literally the same cache entry.
+
+### A.3 Run it
+
+From the repo root, with the benchmark stack built (`bash
+scripts/run-basicmsg-benchmark.sh up`):
+
+```bash
+# 1. Fast-path inbound (default FASTPATH_INBOUND=1). Recreate the issuer to be sure:
+FASTPATH_INBOUND=1 docker compose -p owl-benchmark \
+  -f docker-compose.demo.yml -f docker-compose.benchmark.yml \
+  --env-file sample.benchmark.env up -d --force-recreate issuer
+
+# wait for live
+until curl -sf http://localhost:8150/status/live >/dev/null; do sleep 2; done
+
+# replay 10k authcrypt BasicMessages from a helper container on the bench network
+docker run --rm --entrypoint python --network owl-benchmark_app-network \
+  -v "$PWD/scripts:/bench:ro" acapy-cache-redis \
+  /bench/run-inbound-benchmark.py --messages 10000 --concurrency 20
+
+# 2. Stock baseline — same replay against a stock inbound issuer:
+FASTPATH_INBOUND=0 docker compose -p owl-benchmark \
+  -f docker-compose.demo.yml -f docker-compose.benchmark.yml \
+  --env-file sample.benchmark.env up -d --force-recreate issuer
+until curl -sf http://localhost:8150/status/live >/dev/null; do sleep 2; done
+docker run --rm --entrypoint python --network owl-benchmark_app-network \
+  -v "$PWD/scripts:/bench:ro" acapy-cache-redis \
+  /bench/run-inbound-benchmark.py --messages 10000 --concurrency 20
+```
+
+The script creates one static connection, warms the shared object with a single
+outbound send, then replays a wire-valid authcrypt envelope while polling
+`GET /didcomm-fastpath/stats`. It prints JSON with `handled_rps`,
+`cache_hits`/`cache_misses`, and hot vs cold unpack timings. Flags:
+`--messages`, `--concurrency`, `--admin-url`, `--inbound-url`, `--timeout`.
+
+Raw artifacts for the runs above: `results/basicmsg/inbound-fastpath/` and
+`results/basicmsg/inbound-stock/` (summarized in
+`results/basicmsg/INBOUND.md`).
