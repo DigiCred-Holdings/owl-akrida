@@ -52,6 +52,15 @@ Before starting any load testing you **SHOULD** gain written permission that inc
 
 To get started quickly on your local machine, you can try out the [Quick Start Guide](./docs/QUICKSTART.md)
 
+### ACA-Py basic-message throughput investigation
+
+To reproduce the DigiCred ACA-Py DIDComm basic-message throughput study (stock ~50 msg/s,
+`didcomm_fastpath`, mock-holder ceiling ~170–210 msg/s):
+
+- **Branch:** `benchmark/basic-msg-10k`
+- **Replication guide:** [docs/REPLICATE_THROUGHPUT.md](./docs/REPLICATE_THROUGHPUT.md)
+- **Full report:** [docs/ACAPY_THROUGHPUT_REPORT.md](./docs/ACAPY_THROUGHPUT_REPORT.md)
+
 For high concurrency testing, it is useful to run Locust on a VM where you can easily add more resources for bigger tests. Please read [docs/VM.md](./docs/VM.md)
 
 ### Demo

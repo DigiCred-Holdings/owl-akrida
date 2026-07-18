@@ -9,3 +9,7 @@ node_modules
 .venv
 venv/
 __pycache__/
+*.egg-info/
+.benchmark.runtime.env
+results/basicmsg/
+data/

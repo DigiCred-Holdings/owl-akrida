@@ -1,0 +1,39 @@
+label: IssuerBenchmark
+wallet-name: issuer-benchmark
+inbound-transport:
+  - [http, 0.0.0.0, 8151]
+admin: [0.0.0.0, 8150]
+plugin:
+  - acapy_cache_redis.v0_1
+
+# Basic-message benchmark does not require a ledger
+no-ledger: true
+
+# Transport
+outbound-transport: http
+emit-new-didcomm-prefix: true
+
+# Connections
+debug-connections: false
+debug-credentials: false
+debug-presentations: false
+auto-accept-invites: true
+auto-accept-requests: true
+auto-ping-connection: true
+public-invites: true
+
+# Credentials and Presentations (unused for basic messages, kept for parity)
+preserve-exchange-records: false
+auto-store-credential: true
+auto-respond-credential-proposal: true
+auto-respond-credential-offer: true
+auto-respond-credential-request: true
+auto-respond-presentation-proposal: true
+auto-respond-presentation-request: true
+auto-verify-presentation: true
+
+# Wallet
+wallet-type: askar
+wallet-key: "insecure, for use in demo only"
+auto-provision: true
+wallet-storage-type: "postgres_storage"

@@ -347,3 +347,24 @@ class CustomClient:
         line = self.readjsonline()
 
         return line
+
+    @stopwatch
+    def msg_client_admin_only(self, connection_id):
+        """Measure only ACA-Py admin API send-message (no Credo receipt wait)."""
+        return self.issuer.send_message(connection_id, self.messageToSend)
+
+    @stopwatch
+    def msg_client_fastpath(self, connection_id):
+        """Fast-path send + wait for Credo receipt (e2e via plugin route)."""
+        self.run_command({"cmd": "receiveMessage"})
+
+        self.issuer.send_message_fastpath(connection_id, self.messageToSend)
+
+        line = self.readjsonline()
+
+        return line
+
+    @stopwatch
+    def msg_client_fastpath_admin_only(self, connection_id):
+        """Measure only the fastpath plugin send (no Credo receipt wait)."""
+        return self.issuer.send_message_fastpath(connection_id, self.messageToSend)

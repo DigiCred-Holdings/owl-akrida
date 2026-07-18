@@ -40,6 +40,16 @@ else if (process.env.LEDGER == "indicio") {
         connectOnStartup: true,
     };
 }
+else {
+    // Basic-message benchmarks do not need a live Indy pool.
+    ledger = {
+        genesisTransactions: ReadGenesisTransactions("./networks/indicio-test.txn"),
+        id: "OfflineBenchmark",
+        indyNamespace: 'indicio:test',
+        isProduction: false,
+        connectOnStartup: false,
+    };
+}
 exports.mediation_url = process.env.MEDIATION_URL;
 exports.agent_ip = process.env.AGENT_IP;
 exports.verified_timeout_seconds = (process.env.VERIFIED_TIMEOUT_SECONDS || 120);

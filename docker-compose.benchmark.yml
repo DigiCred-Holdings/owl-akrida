@@ -1,0 +1,102 @@
+# Overlay for docker-compose.demo.yml used by the local basic-message benchmark.
+# Usage:
+#   docker compose -p owl-benchmark \
+#     -f docker-compose.demo.yml -f docker-compose.benchmark.yml \
+#     --env-file sample.benchmark.env up -d --build
+
+services:
+  load-agent:
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - BROWSER=none
+      - MEDIATION_URL=${MEDIATION_URL:-}
+      - LOCUST_MIN_WAIT=${LOCUST_MIN_WAIT:-0}
+      - LOCUST_MAX_WAIT=${LOCUST_MAX_WAIT:-0}
+      - ISSUER_URL=${ISSUER_URL:-http://issuer:8150}
+      - ISSUER_HEADERS=${ISSUER_HEADERS:-{}}
+      - VERIFIER_URL=${VERIFIER_URL:-http://issuer:8150}
+      - VERIFIER_HEADERS=${VERIFIER_HEADERS:-{}}
+      - ISSUER_TYPE=${ISSUER_TYPE:-acapy}
+      - VERIFIER_TYPE=${VERIFIER_TYPE:-acapy}
+      - AGENT_IP=${AGENT_IP:-load-agent}
+      - CRED_DEF=${CRED_DEF:-unused}
+      - CRED_ATTR=${CRED_ATTR}
+      - SCHEMA=${SCHEMA:-unused}
+      - LEDGER=${LEDGER:-none}
+      - START_PORT=${START_PORT:-10000}
+      - END_PORT=${END_PORT:-10100}
+      - MESSAGE_TO_SEND=${MESSAGE_TO_SEND:-ping}
+      - VERIFIED_TIMEOUT_SECONDS=${VERIFIED_TIMEOUT_SECONDS:-60}
+      - WITH_MEDIATION=${WITH_MEDIATION:-}
+      - CONNECTIONS_PER_AGENT=${CONNECTIONS_PER_AGENT:-1}
+      - TARGET_MESSAGE_COUNT=${TARGET_MESSAGE_COUNT:-10000}
+      - LOCUST_USERS=${LOCUST_USERS:-1}
+      - PICKUP_STRATEGY=${PICKUP_STRATEGY:-implicit}
+      - MEASURE_MODE=${MEASURE_MODE:-e2e}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./results:/load-agent/results
+      - ./data:/load-agent/data
+      # Live-mount Python harness so benchmark iterations do not require image rebuilds.
+      - ./load-agent/locust-files:/load-agent/locust-files
+      - ./load-agent/basicmsg_counter.py:/load-agent/basicmsg_counter.py
+      - ./load-agent/locustClient.py:/load-agent/locustClient.py
+      - ./load-agent/settings.py:/load-agent/settings.py
+      - ./load-agent/agents:/load-agent/agents
+
+    # Interactive default keeps the stack up; run scripts override the command.
+    command: >
+      pdm run locust -f locust-files/${LOCUST_FILES:-locustBasicMsgBenchmark.py}
+        --web-host 0.0.0.0 --web-port 8089
+
+  issuer:
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ACAPY_ADMIN_API_KEY: ""
+      ACAPY_ADMIN_INSECURE_MODE: "true"
+      ACAPY_ARG_FILE: ${ACAPY_ARG_FILE:-issuer-benchmark.yml}
+      ACAPY_LOG_LEVEL: ${ACAPY_LOG_LEVEL:-info}
+      ACAPY_USE_REDIS: ${ACAPY_USE_REDIS:-1}
+      ACAPY_WALLET_STORAGE_CONFIG: ${ACAPY_WALLET_STORAGE_CONFIG:-}
+      ACAPY_WALLET_STORAGE_CREDS: ${ACAPY_WALLET_STORAGE_CREDS}
+      FASTPATH_DELIVER_OVERRIDE: ${FASTPATH_DELIVER_OVERRIDE:-}
+      FASTPATH_PACK_WORKERS: ${FASTPATH_PACK_WORKERS:-32}
+    volumes:
+      - ./instance-configs/acapy-agent/configs:/home/aries/configs:ro,z
+      - issuer-askar-sqlite:/home/aries/.aries_cloudagent
+      - ./results:/results
+      # Live-mount so plugin changes apply without image rebuild.
+      - ./instance-configs/acapy-agent/plugins/didcomm_fastpath/didcomm_fastpath:/home/aries/.local/lib/python3.12/site-packages/didcomm_fastpath:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        ARGS=(start
+          --arg-file "./configs/$${ACAPY_ARG_FILE}"
+          --endpoint http://issuer:8151
+          --log-level "$${ACAPY_LOG_LEVEL}")
+        if [ "$${ACAPY_USE_REDIS}" = "1" ]; then
+          ARGS+=(--plugin-config-value "redis_cache.connection=redis://redis-host:6379/0")
+          ARGS+=(--plugin-config-value "redis_cache.max_connections=90")
+        fi
+        exec aca-py "$${ARGS[@]}"
+
+  mock-holder:
+    build:
+      context: ./mock-holder
+    hostname: mock-holder
+    networks:
+      - app-network
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  issuer-askar-sqlite:

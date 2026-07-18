@@ -45,8 +45,23 @@ class BaseAgent(ABC):
         return True
 
     def send_message(self, connection_id, msg):
-        requests.post(
+        r = requests.post(
             f"{self.agent_url}/connections/{connection_id}/send-message",
             json={"content": msg},
             headers=self.headers,
+            timeout=Settings.READ_TIMEOUT_SECONDS,
         )
+        if r.status_code >= 400:
+            raise Exception(f"send-message failed: {r.status_code} {r.text}")
+        return r
+
+    def send_message_fastpath(self, connection_id, msg):
+        r = requests.post(
+            f"{self.agent_url}/didcomm-fastpath/connections/{connection_id}/send-message",
+            json={"content": msg},
+            headers=self.headers,
+            timeout=Settings.READ_TIMEOUT_SECONDS,
+        )
+        if r.status_code >= 400:
+            raise Exception(f"fastpath send-message failed: {r.status_code} {r.text}")
+        return r

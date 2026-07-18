@@ -1,0 +1,23 @@
+label: IssuerIsolatedSqlite
+wallet-name: issuer-isolated-sqlite
+inbound-transport:
+  - [http, 0.0.0.0, 8151]
+admin: [0.0.0.0, 8150]
+
+# Stripped for ACA-Py isolation: no Redis, no Postgres — Askar default local SQLite
+no-ledger: true
+
+outbound-transport: http
+emit-new-didcomm-prefix: true
+
+auto-accept-invites: true
+auto-accept-requests: true
+auto-ping-connection: false
+public-invites: true
+
+preserve-exchange-records: false
+
+wallet-type: askar
+wallet-key: "insecure, for use in demo only"
+auto-provision: true
+# No wallet-storage-type → Askar uses local SQLite under the agent home directory

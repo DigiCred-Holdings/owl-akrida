@@ -1,0 +1,27 @@
+label: IssuerIsolatedPostgresFastpath
+wallet-name: issuer-isolated-pg
+inbound-transport:
+  - [http, 0.0.0.0, 8151]
+admin: [0.0.0.0, 8150]
+
+# Stripped for ACA-Py isolation: no Redis plugin, no ledger
+no-ledger: true
+
+outbound-transport: http
+emit-new-didcomm-prefix: true
+
+auto-accept-invites: true
+auto-accept-requests: true
+auto-ping-connection: false
+public-invites: true
+
+preserve-exchange-records: false
+
+wallet-type: askar
+wallet-key: "insecure, for use in demo only"
+auto-provision: true
+wallet-storage-type: "postgres_storage"
+
+# Experimental fast-path send pipeline
+plugin:
+  - didcomm_fastpath

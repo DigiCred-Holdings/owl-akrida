@@ -1,0 +1,12 @@
+[project]
+name = "didcomm-fastpath"
+version = "0.1.0"
+description = "Experimental fast-path DIDComm v1 basic-message send pipeline for ACA-Py benchmarking"
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["didcomm_fastpath*"]
