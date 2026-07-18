@@ -15,8 +15,8 @@
 
 A stress test reported that a single ACA-Py agent could push only **~45–50 DIDComm basic
 messages/second**, blamed it on a **"serialized event loop,"** and noted a modern Credo agent
-reportedly reaching **~170 msg/s**. We set out to (a) reproduce it, (b) find the real cause, and
-(c) see how far one ACA-Py process can actually go.
+reportedly reaching **~170 msg/s**. We set out to (1) reproduce it, (2) find the real cause, and
+(3) see how far one ACA-Py process can actually go.
 
 ## 2. Answers, up front
 
