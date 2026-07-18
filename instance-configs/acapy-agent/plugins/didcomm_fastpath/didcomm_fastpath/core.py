@@ -1,19 +1,25 @@
-"""Fast-path DIDComm v1 basic-message send pipeline.
+"""Fast-path DIDComm v1 send pipeline.
 
 Per-connection crypto material (endpoint, recipient/routing keys, sender key
 converted to X25519, sealed sender blob) is resolved once and cached in memory.
 Subsequent sends skip the ConnRecord fetch, the per-send Askar profile session,
 the per-send sender-key fetch, and the per-send Ed25519->X25519 conversions.
 
+Supports:
+- Basic messages (admin route helper)
+- Arbitrary AgentMessage / raw JSON bytes (used by workflow_protocol)
+
 Every message still gets a fresh CEK, fresh nonces, and a fresh AEAD pass, so
 wire messages remain protocol-valid DIDComm v1 envelopes.
 
 Cache invalidation: any ConnRecord event (update, DID rotation, deletion)
 evicts that connection's cache entry via an event-bus subscription (see
-__init__.setup), and entries expire after FASTPATH_CACHE_TTL seconds
+v1_0.__init__.setup), and entries expire after FASTPATH_CACHE_TTL seconds
 (default 300, 0 disables) as a fallback. DELETE /didcomm-fastpath/cache
 still clears everything manually.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
@@ -24,7 +30,7 @@ import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from aiohttp import ClientSession, DummyCookieJar, TCPConnector
 from aries_askar import Key, KeyAlg, crypto_box
@@ -104,8 +110,12 @@ class FastpathState:
         self.stats: Dict[str, StageStats] = {s: StageStats() for s in self.STAGES}
         self.first_send_ts: Optional[float] = None
         self.last_send_ts: Optional[float] = None
+        # Optional external timing dict (e.g. workflow_protocol stages)
+        self.external_stats: Dict[str, Any] = {}
 
     def record(self, stage: str, ns: int):
+        if stage not in self.stats:
+            self.stats[stage] = StageStats()
         self.stats[stage].add(ns)
 
     def stats_dict(self) -> dict:
@@ -116,6 +126,9 @@ class FastpathState:
             out["observed_rps"] = round(sends / window, 2)
             out["window_seconds"] = round(window, 3)
         out["cached_connections"] = len(self.targets)
+        out["pack_workers"] = _PACK_POOL._max_workers  # type: ignore[attr-defined]
+        if self.external_stats:
+            out["workflow"] = self.external_stats
         return out
 
     def reset_stats(self):
@@ -147,8 +160,7 @@ _PACK_POOL = ThreadPoolExecutor(
 def cache_ttl_seconds() -> float:
     """TTL for cached targets; fallback safety net behind event-bus eviction.
 
-    0 (or negative) disables expiry — useful for benchmarks where the extra
-    resolve would skew steady-state numbers.
+    0 (or negative) disables expiry.
     """
     try:
         return float(os.environ.get("FASTPATH_CACHE_TTL", "300"))
@@ -157,12 +169,7 @@ def cache_ttl_seconds() -> float:
 
 
 def deliver_override_endpoint() -> Optional[str]:
-    """Optional sink URL that replaces the connection endpoint on deliver.
-
-    Packing still uses the real recipient keys from the connection. Only the
-    HTTP hop is redirected — used by the mock-holder benchmark profile to
-    isolate issuer pack+deliver capacity from Credo holder CPU.
-    """
+    """Optional sink URL that replaces the connection endpoint on deliver."""
     value = (os.environ.get("FASTPATH_DELIVER_OVERRIDE") or "").strip()
     return value or None
 
@@ -242,6 +249,20 @@ def build_basicmessage(content: str, use_new_prefix: bool) -> bytes:
     ).encode("utf-8")
 
 
+def serialize_agent_message(message: Any) -> bytes:
+    """Serialize an ACA-Py AgentMessage (or mapping) to DIDComm plaintext bytes."""
+    if isinstance(message, (bytes, bytearray)):
+        return bytes(message)
+    if isinstance(message, str):
+        return message.encode("utf-8")
+    if isinstance(message, dict):
+        return json.dumps(message).encode("utf-8")
+    # AgentMessage.serialize() -> OrderedDict / dict
+    if hasattr(message, "serialize"):
+        return json.dumps(message.serialize()).encode("utf-8")
+    raise TypeError(f"Unsupported message type for fastpath pack: {type(message)!r}")
+
+
 def _pack_authcrypt(
     message: bytes,
     recipients: List[RecipientCrypto],
@@ -315,7 +336,7 @@ def pack_for_target(message: bytes, target: CachedTarget) -> bytes:
     )
     # Wrap in forward messages for each routing key (mediated connections).
     to_key = target.recipients[0].verkey
-    for i, routing_rec in enumerate(target.routing_recipients):
+    for routing_rec in target.routing_recipients:
         forward = json.dumps(
             {
                 "@type": "https://didcomm.org/routing/1.0/forward",
@@ -329,10 +350,56 @@ def pack_for_target(message: bytes, target: CachedTarget) -> bytes:
     return packed
 
 
+async def send_packed(
+    profile: Profile, connection_id: str, message: Union[bytes, Any]
+) -> dict:
+    """Fast-path pack+deliver for arbitrary DIDComm plaintext (or AgentMessage)."""
+    t_total = time.perf_counter_ns()
+    if STATE.first_send_ts is None:
+        STATE.first_send_ts = time.monotonic()
+
+    target = await resolve_target(profile, connection_id)
+
+    t = time.perf_counter_ns()
+    body = serialize_agent_message(message)
+    STATE.record("build", time.perf_counter_ns() - t)
+
+    t = time.perf_counter_ns()
+    packed = await asyncio.get_event_loop().run_in_executor(
+        _PACK_POOL, pack_for_target, body, target
+    )
+    STATE.record("pack", time.perf_counter_ns() - t)
+
+    t = time.perf_counter_ns()
+    mime = (
+        DIDCOMM_V1_MIME
+        if profile.settings.get("emit_new_didcomm_mime_type")
+        else DIDCOMM_V0_MIME
+    )
+    endpoint = deliver_override_endpoint() or target.endpoint
+    async with STATE.http().post(
+        endpoint, data=packed, headers={"Content-Type": mime}
+    ) as resp:
+        if resp.status < 200 or resp.status > 299:
+            raise RuntimeError(f"Delivery failed: HTTP {resp.status} {resp.reason}")
+    STATE.record("deliver", time.perf_counter_ns() - t)
+
+    STATE.record("total", time.perf_counter_ns() - t_total)
+    STATE.last_send_ts = time.monotonic()
+    return {}
+
+
+async def send_agent_message(
+    profile: Profile, connection_id: str, message: Any
+) -> dict:
+    """Alias for send_packed — pack+deliver an ACA-Py AgentMessage."""
+    return await send_packed(profile, connection_id, message)
+
+
 async def send_basicmessage(
     profile: Profile, connection_id: str, content: str
 ) -> dict:
-    """Fast-path send: resolve (cached) -> build -> pack (executor) -> deliver."""
+    """Fast-path send: resolve (cached) -> build basicmessage -> pack -> deliver."""
     t_total = time.perf_counter_ns()
     if STATE.first_send_ts is None:
         STATE.first_send_ts = time.monotonic()
