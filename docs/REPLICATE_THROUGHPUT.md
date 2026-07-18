@@ -1,7 +1,8 @@
 # ACA-Py Basic-Message Throughput — Replication Guide
 
-Reproduce the DigiCred investigation of ACA-Py DIDComm basic-message throughput
-(stock ~50 msg/s → fast-path ~90 against Credo → ~170–210 against a mock sink).
+Reproduce the DigiCred investigation of ACA-Py DIDComm basic-message throughput on
+**ACA-Py 1.6.0** (stock ~58–70 msg/s → fast-path ~94–105 against Credo → ~220–242 against a
+mock sink).
 
 **Full report (problem, results, known vs unknown):**
 [`ACAPY_THROUGHPUT_REPORT.md`](./ACAPY_THROUGHPUT_REPORT.md)
@@ -39,7 +40,7 @@ git checkout benchmark/basic-msg-10k
 
 All commands below are from the **repo root**.
 
-### A. Stock ACA-Py ceiling (~48–55 msg/s) — isolation matrix
+### A. Stock ACA-Py ceiling (~58–70 msg/s) — isolation matrix
 
 ```bash
 bash scripts/run-basicmsg-benchmark.sh up          # build issuer + DBs (+ optional mediator)
@@ -49,7 +50,7 @@ TARGET_MESSAGE_COUNT_OVERRIDE=2000 \
 
 Artifacts: `results/basicmsg/isolate-*/` and `results/basicmsg/ISOLATION.md`.
 
-### B. Fast-path against real Credo holders (~89 msg/s)
+### B. Fast-path against real Credo holders (~94 admin / ~105 e2e)
 
 ```bash
 TARGET_MESSAGE_COUNT_OVERRIDE=2000 \
@@ -65,7 +66,7 @@ Live timings:
 curl -s localhost:8150/didcomm-fastpath/stats | python3 -m json.tool
 ```
 
-### C. True issuer ceiling with mock holder (~170–210 msg/s)
+### C. True issuer ceiling with mock holder (~220–242 msg/s)
 
 Credo still establishes real connections (keys). Delivery is redirected to a
 lightweight HTTP sink that returns `200` without unpacking.
@@ -136,14 +137,14 @@ bash scripts/run-basicmsg-benchmark.sh help
 
 ---
 
-## Expected ballpark numbers (this harness, 12 vCPU WSL2)
+## Expected ballpark numbers (ACA-Py 1.6.0, this harness, 12 vCPU WSL2)
 
 | Scenario | Steady RPS (order of magnitude) |
 |---|---:|
-| Stock concurrent (`isolate-pg-admin`) | ~48–55 |
-| Fast-path → Credo (`fastpath-pg-admin`) | ~85–95 |
-| Fast-path → mock sink @ 20 holders | ~170 |
-| Fast-path → mock sink @ 60 holders | ~200–210 |
+| Stock concurrent (`isolate-pg-admin`) | ~58–70 |
+| Fast-path → Credo (`fastpath-pg-admin` / `-e2e`) | ~94 / ~105 |
+| Fast-path → mock sink @ 20 holders | ~220 |
+| Fast-path → mock sink @ 60 holders | ~240 |
 
 Exact numbers vary by host. Compare **ratios and relative gains**, and check
 `fastpath-stats.json` / `mock-holder-stats.json` under each run directory.

@@ -183,11 +183,13 @@ To remove Credo unpack from the critical path we added:
 
 ## Verdict
 
-- With a mock holder, a **single ACA-Py process clears ~170–210 msg/s** on the fastpath.
-- That matches the original tester’s “Credo ~170 msg/s” claim — once the recipient is cheap.
-- Peak here is **~207 msg/s at 60 concurrent connections**; 80 regresses slightly because
-  warm Credo processes still compete for host CPU even when idle.
-- Deliver mean dropped from ~69 ms → ~13 ms at 20 holders; pack became a co-equal cost.
+> The sink-sweep table immediately above is the **earlier 1.3.0** run. Re-measured on **1.6.0**
+> the ceiling is higher — **~220–242 msg/s** (20/40/60 conns), peak ~242 at 60 — see "Final
+> verification run" at the top of this file. The verdict is unchanged and stronger:
+
+- With a mock holder, a **single ACA-Py 1.6.0 process clears ~220–242 msg/s** on the fastpath.
+- That **exceeds** the original tester’s “Credo ~170 msg/s” claim — once the recipient is cheap.
+- Deliver mean drops sharply once the recipient is cheap; pack becomes the co-equal cost.
 - Further gains likely need: fewer co-located Credo processes (or remote load gen),
   ECDH/shared-secret caching inside pack, or multi-process ACA-Py on one host.
 
